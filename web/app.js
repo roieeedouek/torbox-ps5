@@ -255,7 +255,8 @@ function renderJobs() {
     else if (j.done > 0) parts.push(size(j.done));
     if (running && j.speed > 0) parts.push(size(j.speed) + "/s");
     if (running && j.speed > 0 && j.total > 0) parts.push(duration((j.total - j.done) / j.speed) + " left");
-    if (running && j.conns) parts.push(j.conns + " connection" + (j.conns > 1 ? "s" : ""));
+    if (running && j.conns) parts.push((j.conns > 1 ? j.active + " of " + j.conns + " connections active" : "1 connection") +
+      (j.waiting ? " (" + j.waiting + " waiting: the server limits connections)" : ""));
     const canPause = ["queued", "starting", "downloading"].includes(j.state);
     const canResume = ["paused", "failed", "cancelled"].includes(j.state);
     const canCancel = ["queued", "starting", "downloading", "paused", "failed"].includes(j.state);

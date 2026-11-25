@@ -32,7 +32,8 @@ typedef struct job {
     char folder[1024], subdir[512], name[256], path[1800];
     int64_t total, done, start_done, started_ms, finished_ms;
     double speed;
-    int conns;
+    int conns, active, waiting; // started connections; of those, receiving now; waiting out a server limit
+    long last_code;             // last HTTP status a connection got
     char err[300], note[160];
 } job;
 
@@ -155,6 +156,8 @@ typedef struct seg {
     int64_t start, end; // inclusive range
     volatile int64_t pos;  // next byte to write (on disk)
     volatile int64_t seen; // received, including what still sits in the write buffer (progress display)
+    volatile int64_t last_data_ms;
+    volatile int waiting;  // in a 429/503 back-off
 } seg;
 
 typedef struct xfer {
@@ -168,6 +171,7 @@ typedef struct xfer {
     int live;          // running connection threads
     int failed;        // a connection gave up
     long http_error;   // last HTTP status >= 400 seen
+    volatile long last_code;
     int disk_error;    // errno of a failed write
     char err[256];
 } xfer;
@@ -231,7 +235,9 @@ static size_t on_data(char *p, size_t sz, size_t n, void *ud) {
         c->used += take, at += take;
         if (c->used == WBUF && flush_conn(c)) return 0;
     }
-    __atomic_store_n(&c->x->segs[c->index >= 0 ? c->index : 0].seen, c->off + (int64_t)c->used, __ATOMIC_RELAXED);
+    seg *sg = &c->x->segs[c->index >= 0 ? c->index : 0];
+    __atomic_store_n(&sg->seen, c->off + (int64_t)c->used, __ATOMIC_RELAXED);
+    sg->last_data_ms = plat_now_ms();
     return sz * n;
 }
 
@@ -291,11 +297,14 @@ static void run_conn(conn *c) {
         if (x->j->stop || g_quit || x->failed || !flushed || x->disk_error) break;
         long code = 0;
         curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+        if (code) x->last_code = code;
         if ((code == 429 || code == 503) && busy < 60) {
             // The server limits parallel connections: wait for a free slot (others keep going), then retry.
             int wait = 2 + busy * 2 < 20 ? 2 + busy * 2 : 20;
             busy++, attempt--;
+            s->waiting = 1;
             for (int t = 0; t < wait * 4 && !x->j->stop && !g_quit && !x->failed; t++) plat_sleep_ms(250);
+            s->waiting = 0;
             continue;
         }
         if (rc == CURLE_HTTP_RETURNED_ERROR || code >= 400) {
@@ -538,8 +547,13 @@ static int transfer(job *j, const char *url, char *err, size_t errlen) {
             last_ms = now, last_done = d;
         }
         if (!single && now - last_save >= 5000) save_state(x, total), last_save = now;
+        int active = 0, waiting = 0;
+        for (int i = 0; i < x->nseg; i++) {
+            active += now - x->segs[i].last_data_ms < 3000;
+            waiting += x->segs[i].waiting;
+        }
         pthread_mutex_lock(&g_lock);
-        j->done = d, j->speed = speed;
+        j->done = d, j->speed = speed, j->active = active, j->waiting = waiting, j->last_code = x->last_code;
         pthread_mutex_unlock(&g_lock);
         pthread_mutex_lock(&x->lock);
     }
@@ -550,7 +564,7 @@ static int transfer(job *j, const char *url, char *err, size_t errlen) {
     if (fsync(x->fd)) { /* best effort */ }
     close(x->fd);
     pthread_mutex_lock(&g_lock);
-    j->done = d, j->speed = 0, j->conns = 0;
+    j->done = d, j->speed = 0, j->conns = j->active = j->waiting = 0;
     if (single && total < 0) j->total = d;
     pthread_mutex_unlock(&g_lock);
     int result;
@@ -879,8 +893,9 @@ void dl_jobs_json(sbuf *o) {
         job *j = g_jobs[i];
         if (i) sb_puts(o, ",");
         sb_printf(o, "{\"id\":%d,\"kind\":\"%s\",\"state\":\"%s\",\"total\":%lld,\"done\":%lld,\"speed\":%.0f,"
-                     "\"conns\":%d,\"name\":",
-                  j->id, j->kind, state_names[j->state], (long long)j->total, (long long)j->done, j->speed, j->conns);
+                     "\"conns\":%d,\"active\":%d,\"waiting\":%d,\"http\":%ld,\"name\":",
+                  j->id, j->kind, state_names[j->state], (long long)j->total, (long long)j->done, j->speed, j->conns,
+                  j->active, j->waiting, j->last_code);
         char shown[800];
         snprintf(shown, sizeof shown, "%s%s%s", j->subdir, j->subdir[0] ? "/" : "", j->name);
         sb_json_str(o, shown);
