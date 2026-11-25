@@ -2,8 +2,9 @@
 //
 // The server runs as an elfldr payload, not inside this title: a title is closed when another game starts (and
 // stopped in rest mode), which would cut downloads off. The payload keeps running while the user plays.
-// Flow: if something already answers on port 8080, just show the address; else stream /app0/torbox-ps5.elf to
-// elfldr on 127.0.0.1:9021, wait for the server to come up, show the address, exit.
+// Flow: if nothing answers on port 8080 yet, stream /app0/torbox-ps5.elf to elfldr on 127.0.0.1:9021 and wait
+// for the server; then open the console's web browser on http://127.0.0.1:8080 (the same page phones and PCs
+// use), and exit.
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -22,6 +23,8 @@ typedef struct notify_request {
 int sceKernelSendNotificationRequest(int, notify_request_t *, size_t, int);
 int sceKernelDebugOutText(int channel, const char *text);
 int sceSystemServiceLoadExec(const char *path, char *const argv[]);
+int sceSystemServiceLaunchWebBrowser(const char *uri, void *param);
+int sceUserServiceInitialize(void *param);
 
 #define SERVER_PORT 8080
 #define ELFLDR_PORT 9021
@@ -112,20 +115,23 @@ int main(void) {
     char ip[64], url[128];
     local_ip(ip, sizeof ip);
     snprintf(url, sizeof url, "http://%s:%d", ip, SERVER_PORT);
-    if (server_up()) {
-        notify("TorBox is running: open %s", url);
-    } else {
+    int up = server_up();
+    if (!up) {
         int rc = send_payload();
         if (rc == -1) notify("TorBox: elfldr is not listening on port 9021. Start your ELF loader, or send "
                              "torbox-ps5.elf to it yourself. (%s)", "no server started");
         else if (rc) notify("TorBox: could not start the server (%s)", rc == -2 ? "torbox-ps5.elf missing" : "send failed");
         else {
-            int up = 0;
             for (int i = 0; i < 50 && !(up = server_up()); i++) usleep(200 * 1000);
             if (!up) notify("TorBox: the server did not answer on %s yet", url); // when up, it says so itself
         }
     }
-    sleep(2); // let the notification show before the title closes
+    if (up) {
+        sceUserServiceInitialize(NULL);
+        if (sceSystemServiceLaunchWebBrowser("http://127.0.0.1:" "8080", NULL))
+            notify("TorBox is running: open %s from a phone or PC", url);
+    }
+    sleep(2); // let the browser come up / the notification show before the title closes
     catchReturnFromMain(0);
     return 0;
 }
