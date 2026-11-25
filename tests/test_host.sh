@@ -124,6 +124,22 @@ check "job restored after restart" bash -c "curl -s $base/api/jobs | grep -q slo
 check "resumed download finishes" wait_jobs 120
 check "slow.bin content after pause+restart" verify "$work/dl/d/slow.bin" $((48 * 1048576))
 
+# Pause with 2 connections, resume with 8: idle connections split the remaining segments.
+post settings -d connections=2 > /dev/null
+id=$(post download -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((64 * 1048576))?rate=1500000" \
+    --data-urlencode "folder=$work/dl/g" -d name=steal.bin | jq_ 'd["id"]')
+sleep 3
+post jobs/pause -d id="$id" > /dev/null
+sleep 1.5
+post settings -d connections=8 > /dev/null
+post jobs/resume -d id="$id" > /dev/null
+sleep 4
+conns=$(get jobs | jq_ "[j['conns'] for j in d['jobs'] if j['id']==$id][0]")
+check "resume with more connections splits segments ($conns)" test "$conns" -ge 6
+check "split download finishes" wait_jobs 120
+check "steal.bin content" verify "$work/dl/g/steal.bin" $((64 * 1048576))
+post settings -d connections=6 > /dev/null
+
 # Cancel deletes the partial file.
 id=$(post download -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((48 * 1048576))?rate=2000000" \
     --data-urlencode "folder=$work/dl/e" -d name=cancel.bin | jq_ 'd["id"]')

@@ -19,9 +19,11 @@ enum { J_QUEUED, J_STARTING, J_RUNNING, J_DONE, J_FAILED, J_PAUSED, J_CANCELLED 
 static const char *state_names[] = {"queued", "starting", "downloading", "done", "failed", "paused", "cancelled"};
 
 #define MAX_JOBS 1000
-#define MAX_SEGS 16
-#define SEG_MIN (16ll * 1024 * 1024) // no segment smaller than this
-#define WBUF (4 * 1024 * 1024)        // write buffer per connection: 4 MiB writes measured 179 MB/s on /data, 1 MiB 130
+#define MAX_CONNS 32                   // connections per file
+#define MAX_SEGS 256                   // segment table entries (they grow when idle connections split segments)
+#define MULTI_MIN (8ll * 1024 * 1024)  // smaller files use one connection
+#define SPLIT_MIN (8ll * 1024 * 1024)  // only segments with at least this much left are split
+#define WBUF (2 * 1024 * 1024)         // write buffer per connection (1 MiB writes measured 130 MB/s on /data, 4 MiB 179)
 
 typedef struct job {
     int id, state;
@@ -39,7 +41,7 @@ typedef struct job {
 
 static job *g_jobs[MAX_JOBS];
 static int g_njobs, g_next_id = 1, g_running;
-static int g_parallel = 2, g_connections = 8;
+static int g_parallel = 1, g_connections = 16;
 static volatile int g_quit;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
@@ -85,7 +87,7 @@ static void load_settings(void) {
     while (fgets(line, sizeof line, f)) {
         int v;
         if (sscanf(line, "parallel=%d", &v) == 1 && v >= 1 && v <= 3) g_parallel = v;
-        if (sscanf(line, "connections=%d", &v) == 1 && v >= 1 && v <= MAX_SEGS) g_connections = v;
+        if (sscanf(line, "connections=%d", &v) == 1 && v >= 1 && v <= MAX_CONNS) g_connections = v;
     }
     fclose(f);
 }
@@ -158,13 +160,14 @@ typedef struct seg {
     volatile int64_t seen; // received, including what still sits in the write buffer (progress display)
     volatile int64_t last_data_ms;
     volatile int waiting;  // in a 429/503 back-off
+    int owned;             // a connection works on it (x->lock)
 } seg;
 
 typedef struct xfer {
     job *j;
     const char *url;
     int fd;
-    int nseg;
+    volatile int nseg; // grows (under lock) when a segment is split
     seg segs[MAX_SEGS];
     pthread_mutex_t lock;
     pthread_cond_t cv;
@@ -224,7 +227,7 @@ static size_t on_data(char *p, size_t sz, size_t n, void *ud) {
     }
     if (c->index >= 0) { // never write past the segment end
         seg *s = &c->x->segs[c->index];
-        int64_t room = s->end + 1 - (c->off + (int64_t)c->used);
+        int64_t room = __atomic_load_n(&s->end, __ATOMIC_ACQUIRE) + 1 - (c->off + (int64_t)c->used);
         if (room <= 0) return 0;
         if ((int64_t)len > room) len = (size_t)room;
     }
@@ -247,16 +250,16 @@ static int on_progress(void *ud, curl_off_t dt, curl_off_t dn, curl_off_t ut, cu
     return c->x->j->stop || g_quit || c->x->failed;
 }
 
-// One connection: fetches its segment (or the whole file), retrying network errors a few times.
-static void run_conn(conn *c) {
+// Fetches the connection's segment (or the whole file), retrying network errors a few times. 1 = complete.
+static int fetch(conn *c) {
     xfer *x = c->x;
-    CURL *h = c->h = curl_easy_init();
+    CURL *h = c->h;
     int ok = 0, busy = 0;
     for (int attempt = 0; h && attempt < 4; attempt++) {
         seg *s = &x->segs[c->index >= 0 ? c->index : 0];
         c->off = __atomic_load_n(&s->pos, __ATOMIC_RELAXED);
         c->used = 0, c->checked = 0;
-        if (c->index >= 0 && c->off > s->end) { // segment complete
+        if (c->index >= 0 && c->off > __atomic_load_n(&s->end, __ATOMIC_ACQUIRE)) { // segment complete
             ok = 1;
             break;
         }
@@ -276,13 +279,15 @@ static void run_conn(conn *c) {
         curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
         char range[64];
         if (c->index >= 0) {
-            snprintf(range, sizeof range, "%lld-%lld", (long long)c->off, (long long)s->end);
+            snprintf(range, sizeof range, "%lld-%lld", (long long)c->off,
+                     (long long)__atomic_load_n(&s->end, __ATOMIC_ACQUIRE));
             curl_easy_setopt(h, CURLOPT_RANGE, range);
         } else if (c->off > 0) curl_easy_setopt(h, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)c->off);
         int64_t before = c->off;
         CURLcode rc = curl_easy_perform(h);
         int flushed = flush_conn(c) == 0;
-        if (flushed && c->index >= 0 && __atomic_load_n(&s->pos, __ATOMIC_RELAXED) > s->end) {
+        if (flushed && c->index >= 0 &&
+            __atomic_load_n(&s->pos, __ATOMIC_RELAXED) > __atomic_load_n(&s->end, __ATOMIC_ACQUIRE)) {
             ok = 1;
             break;
         }
@@ -324,17 +329,67 @@ static void run_conn(conn *c) {
         pthread_mutex_unlock(&x->lock);
         plat_sleep_ms(2000);
     }
-    if (h) curl_easy_cleanup(h);
+    return ok;
+}
+
+// Gives a connection work: an unowned unfinished segment, or else the second half of the segment with the most
+// left (its owner stops at the new end). -1 = nothing worth taking. Keeps every connection busy until the end.
+static int claim(xfer *x) {
+    pthread_mutex_lock(&x->lock);
+    int best = -1;
+    int64_t best_left = 0;
+    for (int i = 0; i < x->nseg; i++) {
+        seg *s = &x->segs[i];
+        int64_t end = __atomic_load_n(&s->end, __ATOMIC_ACQUIRE);
+        int64_t at = __atomic_load_n(&s->seen, __ATOMIC_RELAXED);
+        int64_t pos = __atomic_load_n(&s->pos, __ATOMIC_RELAXED);
+        if (at < pos) at = pos;
+        if (!s->owned && pos <= end) {
+            s->owned = 1;
+            pthread_mutex_unlock(&x->lock);
+            return i;
+        }
+        if (s->owned && end - at > best_left) best = i, best_left = end - at;
+    }
+    int got = -1;
+    if (best >= 0 && best_left >= SPLIT_MIN && x->nseg < MAX_SEGS) {
+        seg *s = &x->segs[best];
+        int64_t at = __atomic_load_n(&s->seen, __ATOMIC_RELAXED);
+        int64_t mid = at + best_left / 2;
+        got = x->nseg;
+        seg *n = &x->segs[got];
+        memset(n, 0, sizeof *n);
+        n->start = n->pos = n->seen = mid + 1;
+        n->end = s->end;
+        n->owned = 1;
+        __atomic_store_n(&s->end, mid, __ATOMIC_RELEASE);
+        __atomic_store_n(&x->nseg, got + 1, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&x->lock);
+    return got;
+}
+
+static void *conn_thread(void *arg) {
+    conn *c = arg;
+    xfer *x = c->x;
+    c->h = curl_easy_init();
+    int ok = c->h != NULL;
+    while (ok) {
+        ok = fetch(c);
+        if (c->index < 0) break; // single stream
+        pthread_mutex_lock(&x->lock);
+        x->segs[c->index].owned = 0;
+        pthread_mutex_unlock(&x->lock);
+        if (!ok || x->j->stop || g_quit || x->failed) break;
+        c->index = claim(x);
+        if (c->index < 0) break;
+    }
+    if (c->h) curl_easy_cleanup(c->h);
     pthread_mutex_lock(&x->lock);
     if (!ok) x->failed = 1;
     x->live--;
     pthread_cond_broadcast(&x->cv);
     pthread_mutex_unlock(&x->lock);
-}
-
-static void *conn_thread(void *arg) {
-    conn *c = arg;
-    run_conn(c);
     free(c->buf);
     free(c);
     return NULL;
@@ -417,7 +472,15 @@ static int load_state(xfer *x, int64_t total) {
     }
     fclose(f);
     if (!ok) return -1;
-    x->nseg = n;
+    int k = 0; // drop finished segments: the table only needs what is left
+    for (int i = 0; i < n; i++)
+        if (x->segs[i].pos <= x->segs[i].end) x->segs[k++] = x->segs[i];
+    for (int i = 0; i < k; i++) x->segs[i].seen = x->segs[i].pos;
+    if (k == 0) { // all done: keep one empty segment so the table stays valid
+        x->segs[0].start = x->segs[0].pos = x->segs[0].seen = total, x->segs[0].end = total - 1;
+        k = 1;
+    }
+    x->nseg = k;
     return 0;
 }
 
@@ -427,23 +490,37 @@ static void save_state(xfer *x, int64_t total) {
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "w");
     if (!f) return;
+    pthread_mutex_lock(&x->lock);
     fprintf(f, "torbox-ps5 1 %lld %d\n", (long long)total, x->nseg);
-    for (int i = 0; i < x->nseg; i++)
-        fprintf(f, "%lld %lld %lld\n", (long long)x->segs[i].start, (long long)x->segs[i].end,
-                (long long)__atomic_load_n(&x->segs[i].pos, __ATOMIC_RELAXED));
+    for (int i = 0; i < x->nseg; i++) {
+        int64_t end = __atomic_load_n(&x->segs[i].end, __ATOMIC_ACQUIRE);
+        int64_t pos = __atomic_load_n(&x->segs[i].pos, __ATOMIC_RELAXED);
+        fprintf(f, "%lld %lld %lld\n", (long long)x->segs[i].start, (long long)end,
+                (long long)(pos > end + 1 ? end + 1 : pos));
+    }
+    pthread_mutex_unlock(&x->lock);
     fclose(f);
     rename(tmp, path);
 }
 
-// Bytes done: on disk (seen = 0) or received (seen = 1, for the progress display).
-static int64_t xfer_done(xfer *x, int single, int seen) {
-    int64_t d = 0;
-    for (int i = 0; i < (single ? 1 : x->nseg); i++) {
+// Bytes done: on disk (seen = 0) or received (seen = 1, for the progress display). The segment table only
+// covers what was left when the job started, so a segmented job counts total minus what is still missing.
+static int64_t xfer_done(xfer *x, int single, int seen, int64_t total) {
+    if (single) {
+        int64_t p = __atomic_load_n(&x->segs[0].pos, __ATOMIC_RELAXED);
+        int64_t r = __atomic_load_n(&x->segs[0].seen, __ATOMIC_RELAXED);
+        return seen && r > p ? r : p;
+    }
+    int64_t left = 0;
+    int n = __atomic_load_n(&x->nseg, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        int64_t end = __atomic_load_n(&x->segs[i].end, __ATOMIC_ACQUIRE);
         int64_t p = __atomic_load_n(&x->segs[i].pos, __ATOMIC_RELAXED);
         int64_t r = __atomic_load_n(&x->segs[i].seen, __ATOMIC_RELAXED);
-        d += (seen && r > p ? r : p) - (single ? 0 : x->segs[i].start);
+        int64_t at = seen && r > p ? r : p;
+        if (at <= end) left += end + 1 - at;
     }
-    return d;
+    return total - left;
 }
 
 enum { T_OK, T_STOPPED, T_RETRY, T_FATAL, T_RELINK };
@@ -463,9 +540,12 @@ static int transfer(job *j, const char *url, char *err, size_t errlen) {
     pthread_mutex_init(&x->lock, NULL);
     pthread_cond_init(&x->cv, NULL);
     int conns = g_connections;
-    int single = !(ranges && total > SEG_MIN && conns > 1);
     struct stat st;
     int64_t have = stat(part, &st) ? 0 : st.st_size;
+    // A segment table from an earlier run is always continued (whatever the connection count is now): a single
+    // stream cannot fill its holes.
+    int resumed = ranges && total > 0 && load_state(x, total) == 0 && have > 0;
+    int single = !resumed && !(ranges && total >= MULTI_MIN && conns > 1);
     if (single) {
         x->nseg = 1;
         x->segs[0].start = 0;
@@ -475,21 +555,20 @@ static int transfer(job *j, const char *url, char *err, size_t errlen) {
         state_path(j, sp, sizeof sp);
         if (!stat(sp, &st) && unlink(sp) == 0) have = 0, unlink(part);
         if (!ranges || (total > 0 && have > total)) have = 0, unlink(part);
-        x->segs[0].pos = have;
+        x->segs[0].pos = x->segs[0].seen = have;
         if (total > 0 && have == total) { // already complete
             free(x);
             return T_OK;
         }
-    } else if (load_state(x, total)) {
-        int n = (int)(total / SEG_MIN);
-        if (n > conns) n = conns;
+    } else if (!resumed) {
+        int n = conns < MAX_CONNS ? conns : MAX_CONNS;
         if (n < 1) n = 1;
         x->nseg = n;
         unlink(part); // any old part without a matching table cannot be trusted
         for (int i = 0; i < n; i++) {
             x->segs[i].start = total * i / n;
             x->segs[i].end = total * (i + 1) / n - 1;
-            x->segs[i].pos = x->segs[i].start;
+            x->segs[i].pos = x->segs[i].seen = x->segs[i].start;
         }
     }
     x->fd = open(part, O_RDWR | O_CREAT, 0666);
@@ -501,29 +580,32 @@ static int transfer(job *j, const char *url, char *err, size_t errlen) {
     if (!single) save_state(x, total);
     pthread_mutex_lock(&g_lock);
     j->total = total;
-    j->done = xfer_done(x, single, 0);
+    j->done = xfer_done(x, single, 0, total);
     j->start_done = j->done;
     j->state = J_RUNNING;
     pthread_mutex_unlock(&g_lock);
 
     int started = 0;
-    for (int i = 0; i < x->nseg; i++) {
-        if (!single && x->segs[i].pos > x->segs[i].end) continue;
+    for (int i = 0; i < (single ? 1 : conns); i++) {
+        int index = single ? -1 : claim(x);
+        if (!single && index < 0) break;
         conn *c = calloc(1, sizeof *c);
         char *buf = c ? malloc(WBUF) : NULL;
         if (!buf) {
             free(c);
-            x->failed = 1;
+            if (!started) x->failed = 1;
+            if (index >= 0) x->segs[index].owned = 0;
             break;
         }
-        c->x = x, c->index = single ? -1 : i, c->buf = buf;
+        c->x = x, c->index = index, c->buf = buf;
         pthread_mutex_lock(&x->lock);
         x->live++;
         pthread_mutex_unlock(&x->lock);
         if (plat_start_thread(conn_thread, c)) {
             pthread_mutex_lock(&x->lock);
             x->live--;
-            x->failed = 1;
+            if (!started) x->failed = 1;
+            if (index >= 0) x->segs[index].owned = 0;
             pthread_mutex_unlock(&x->lock);
             free(buf), free(c);
             break;
@@ -540,26 +622,30 @@ static int transfer(job *j, const char *url, char *err, size_t errlen) {
     while (x->live > 0) {
         pthread_mutex_unlock(&x->lock);
         plat_sleep_ms(500);
-        int64_t now = plat_now_ms(), d = xfer_done(x, single, 1);
+        int64_t now = plat_now_ms(), d = xfer_done(x, single, 1, total);
         if (now - last_ms >= 1000) {
             double inst = (double)(d - last_done) * 1000.0 / (double)(now - last_ms);
             speed = speed == 0 ? inst : speed * 0.6 + inst * 0.4;
             last_ms = now, last_done = d;
         }
         if (!single && now - last_save >= 5000) save_state(x, total), last_save = now;
-        int active = 0, waiting = 0;
-        for (int i = 0; i < x->nseg; i++) {
+        int active = 0, waiting = 0, n = __atomic_load_n(&x->nseg, __ATOMIC_ACQUIRE);
+        for (int i = 0; i < n; i++) {
             active += now - x->segs[i].last_data_ms < 3000;
             waiting += x->segs[i].waiting;
         }
+        pthread_mutex_lock(&x->lock);
+        int live = x->live;
+        pthread_mutex_unlock(&x->lock);
         pthread_mutex_lock(&g_lock);
+        j->conns = live;
         j->done = d, j->speed = speed, j->active = active, j->waiting = waiting, j->last_code = x->last_code;
         pthread_mutex_unlock(&g_lock);
         pthread_mutex_lock(&x->lock);
     }
     pthread_mutex_unlock(&x->lock);
 
-    int64_t d = xfer_done(x, single, 0);
+    int64_t d = xfer_done(x, single, 0, total);
     int complete = !x->failed && !j->stop && !g_quit && !x->disk_error && (total < 0 || d >= total);
     if (fsync(x->fd)) { /* best effort */ }
     close(x->fd);
@@ -880,7 +966,7 @@ int dl_active_count(void) {
 void dl_settings(int parallel, int connections) {
     pthread_mutex_lock(&g_lock);
     if (parallel >= 1 && parallel <= 3) g_parallel = parallel;
-    if (connections >= 1 && connections <= MAX_SEGS) g_connections = connections;
+    if (connections >= 1 && connections <= MAX_CONNS) g_connections = connections;
     save_settings_locked();
     pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_lock);
