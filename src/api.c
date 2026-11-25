@@ -165,6 +165,8 @@ static void add_roots(sbuf *b) {
     sb_puts(b, "\"/data\"");
     first = 0;
     DIR *d = opendir("/mnt");
+    struct stat mnt;
+    if (d && stat("/mnt", &mnt)) closedir(d), d = NULL;
     if (d) {
         struct dirent *e;
         char *names[64];
@@ -172,7 +174,9 @@ static void add_roots(sbuf *b) {
         while ((e = readdir(d)) && n < 64) {
             char p[300];
             snprintf(p, sizeof p, "/mnt/%s", e->d_name);
-            if (plat_path_allowed(p) && strchr(p + 5, '/') == NULL) names[n++] = strdup(p);
+            struct stat st; // an empty mount point lives on /mnt's own device: no drive there
+            if (plat_path_allowed(p) && !stat(p, &st) && S_ISDIR(st.st_mode) && st.st_dev != mnt.st_dev)
+                names[n++] = strdup(p);
         }
         closedir(d);
         qsort(names, n, sizeof *names, cmp_str);
@@ -220,7 +224,9 @@ static void route_dirs(http_req *r) {
             return;
         }
         char **names = NULL;
-        int count = 0, cap = 0;
+        int count = 0, cap = 0, nfiles = 0;
+        sbuf files;
+        sb_init(&files);
         struct dirent *e;
         while ((e = readdir(d))) {
             if (e->d_name[0] == '.') continue;
@@ -231,7 +237,15 @@ static void route_dirs(http_req *r) {
                 struct stat st;
                 is_dir = !stat(full, &st) && S_ISDIR(st.st_mode);
             }
-            if (!is_dir) continue;
+            if (!is_dir) {
+                struct stat st;
+                if (nfiles < 2000 && !stat(full, &st) && S_ISREG(st.st_mode)) {
+                    sb_puts(&files, nfiles++ ? ",{\"name\":" : "{\"name\":");
+                    sb_json_str(&files, e->d_name);
+                    sb_printf(&files, ",\"size\":%lld}", (long long)st.st_size);
+                }
+                continue;
+            }
             if (count == cap) {
                 cap = cap ? cap * 2 : 64;
                 char **nn = realloc(names, cap * sizeof *names);
@@ -262,7 +276,8 @@ static void route_dirs(http_req *r) {
             free(names[i]);
         }
         free(names);
-        sb_puts(&b, "]");
+        sb_printf(&b, "],\"files\":[%s]", files.data ? files.data : "");
+        sb_free(&files);
     }
     sb_puts(&b, "}");
     http_send_json(r->fd, 200, &b);
@@ -345,6 +360,26 @@ static void route_settings(http_req *r) {
     route_jobs(r);
 }
 
+// SHA-256 of a downloaded file, to check it against a known checksum.
+static void route_sha256(http_req *r) {
+    char path[1024], hex[65];
+    form_get(r->query, "path", path, sizeof path);
+    if (!plat_path_allowed(path)) {
+        json_err(r->fd, 403, "this file is outside /data and the USB drives");
+        return;
+    }
+    long long size = 0;
+    if (sha256_file(path, hex, &size)) {
+        json_err(r->fd, 404, strerror(errno));
+        return;
+    }
+    sbuf b;
+    sb_init(&b);
+    sb_printf(&b, "{\"ok\":true,\"size\":%lld,\"sha256\":\"%s\"}", size, hex);
+    http_send_json(r->fd, 200, &b);
+    sb_free(&b);
+}
+
 static void route_static(http_req *r) {
     const char *name = r->path[1] ? r->path + 1 : "index.html";
     const asset *a = asset_find(name);
@@ -371,6 +406,7 @@ void api_handle(http_req *r) {
     else if (get && !strcmp(p, "list")) route_list(r);
     else if (get && !strcmp(p, "dirs")) route_dirs(r);
     else if (get && !strcmp(p, "jobs")) route_jobs(r);
+    else if (get && !strcmp(p, "sha256")) route_sha256(r);
     else if (post && !strcmp(p, "login")) route_login(r);
     else if (post && !strcmp(p, "logout")) route_logout(r);
     else if (post && !strcmp(p, "mkdir")) route_mkdir(r);

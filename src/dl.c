@@ -243,7 +243,7 @@ static int on_progress(void *ud, curl_off_t dt, curl_off_t dn, curl_off_t ut, cu
 static void run_conn(conn *c) {
     xfer *x = c->x;
     CURL *h = c->h = curl_easy_init();
-    int ok = 0;
+    int ok = 0, busy = 0;
     for (int attempt = 0; h && attempt < 4; attempt++) {
         seg *s = &x->segs[c->index >= 0 ? c->index : 0];
         c->off = __atomic_load_n(&s->pos, __ATOMIC_RELAXED);
@@ -289,6 +289,13 @@ static void run_conn(conn *c) {
         if (x->j->stop || g_quit || x->failed || !flushed || x->disk_error) break;
         long code = 0;
         curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+        if ((code == 429 || code == 503) && busy < 60) {
+            // The server limits parallel connections: wait for a free slot (others keep going), then retry.
+            int wait = 2 + busy * 2 < 20 ? 2 + busy * 2 : 20;
+            busy++, attempt--;
+            for (int t = 0; t < wait * 4 && !x->j->stop && !g_quit && !x->failed; t++) plat_sleep_ms(250);
+            continue;
+        }
         if (rc == CURLE_HTTP_RETURNED_ERROR || code >= 400) {
             pthread_mutex_lock(&x->lock);
             x->http_error = code;
@@ -377,7 +384,7 @@ static int probe(const char *url, int64_t *total, int *ranges, char *final_url, 
     } else {
         if (pi.code >= 400) snprintf(err, errlen, "HTTP %ld", pi.code);
         else snprintf(err, errlen, "%s", curl_easy_strerror(rc));
-        return pi.code >= 400 ? -2 : -1;
+        return pi.code >= 400 && pi.code != 429 && pi.code != 503 ? -2 : -1;
     }
     return 0;
 }

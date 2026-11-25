@@ -80,6 +80,9 @@ wait_jobs() { # until no job is queued/starting/downloading, max $1 s
     done
     return 1
 }
+# Server that allows only 2 parallel connections (answers 429 beyond): the other segments wait their turn.
+post download -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((64 * 1048576))?maxconn=2&rate=20000000" \
+    --data-urlencode "folder=$work/dl/f" -d name=limited.bin > /dev/null
 check "downloads finish" wait_jobs 120
 verify() { # file size: byte i must be i % 251
     python3 -I - "$1" "$2" <<'EOF'
@@ -95,6 +98,10 @@ check "movie.mkv content (6 connections)" verify "$work/dl/a/Big Buck Bunny (tes
 check "poster.jpg in subfolder" verify "$work/dl/a/Big Buck Bunny (test)/extras/poster.jpg" $((3 * 1048576))
 check "flaky.bin survived broken connections" verify "$work/dl/b/flaky.bin" $((40 * 1048576))
 check "norange.bin single stream" verify "$work/dl/c/norange.bin" 5000000
+want=$(python3 -I -c "import hashlib; print(hashlib.sha256(bytes(i % 251 for i in range(5000000))).hexdigest())")
+check "sha256 endpoint" bash -c "curl -s '$base/api/sha256?path=$work/dl/c/norange.bin' | grep -q $want"
+check "picker lists files" bash -c "curl -s '$base/api/dirs?path=$work/dl/c' | grep -q '\"files\":\[{\"name\":\"norange.bin\",\"size\":5000000}'"
+check "limited.bin with a 2-connection server limit" verify "$work/dl/f/limited.bin" $((64 * 1048576))
 check "no .part left" bash -c "! find $work/dl -name '*.part*' | grep -q ."
 
 # Pause / resume with a throttled multi-connection download.

@@ -334,8 +334,9 @@ async function browse(path, quiet) {
   $("#picker-free").textContent = r.free !== undefined ? size(r.free) + " free" : "";
   $("#picker-roots").replaceChildren(...r.roots.map((root) => el("button", { type: "button", onclick: () => browse(root) },
     root.startsWith("/mnt/usb") ? "USB " + root.slice(8) : root.startsWith("/mnt/ext") ? "Ext " + root.slice(8) : root)));
-  const items = r.dirs.map((d) => el("li", { onclick: () => browse(r.path.replace(/\/$/, "") + "/" + d) }, d));
-  $("#picker-dirs").replaceChildren(...(items.length ? items : [el("li", { class: "empty" }, "No subfolders")]));
+  const items = r.dirs.map((d) => el("li", { onclick: () => browse(r.path.replace(/\/$/, "") + "/" + d) }, "\u{1F4C1} " + d));
+  const files = (r.files || []).map((f) => el("li", { class: "file" }, el("span", { class: "fname" }, f.name), el("span", { class: "fsize" }, size(f.size))));
+  $("#picker-dirs").replaceChildren(...(items.length || files.length ? items.concat(files) : [el("li", { class: "empty" }, "Empty folder")]));
   return true;
 }
 

@@ -7,11 +7,12 @@ API (same shapes as https://api.torbox.app/v1/api): user/me, {torrents,webdl,use
 The only accepted API key is "test-key-0000".
 Files: /files/<size>[?norange=1][&drop=<bytes>][&rate=<bytes/s>] serve <size> bytes whose byte i is i % 251.
   norange: ignore Range headers;  drop: close each connection after that many bytes (tests resume);
-  rate: throttle each connection.
+  rate: throttle each connection;  maxconn: answer 429 beyond that many parallel connections.
 """
 import json
 import re
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -19,6 +20,8 @@ from urllib.parse import parse_qs, urlparse
 KEY = "test-key-0000"
 PATTERN = bytes(i % 251 for i in range(251 * 4096))
 MIB = 1024 * 1024
+ACTIVE = {}
+ACTIVE_LOCK = threading.Lock()
 
 
 def content(start, length):
@@ -121,6 +124,20 @@ class Handler(BaseHTTPRequestHandler):
                                     "data": "%s/files/%d?x=1%s" % (host, size, extra)})
 
     def serve_file(self, path, q):
+        limit = int(q.get("maxconn", 0))
+        with ACTIVE_LOCK:
+            busy = limit and ACTIVE.get(path, 0) >= limit
+            if not busy:
+                ACTIVE[path] = ACTIVE.get(path, 0) + 1
+        if busy:
+            return self.fail(429, "TOO_MANY", "too many connections")
+        try:
+            self.serve_file_body(path, q)
+        finally:
+            with ACTIVE_LOCK:
+                ACTIVE[path] -= 1
+
+    def serve_file_body(self, path, q):
         size = int(path.split("/")[2])
         start, end, code = 0, size - 1, 200
         rng = self.headers.get("Range")

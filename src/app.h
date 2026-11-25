@@ -38,6 +38,7 @@ int sanitize_relpath(const char *in, char *out, size_t len); // "a/b/c" made of 
 int url_decode(char *s);
 const char *form_get(const char *form, const char *key, char *out, size_t len); // x-www-form-urlencoded
 void url_encode(const char *in, char *out, size_t len);
+int sha256_file(const char *path, char hex[65], long long *size); // sha256.c
 
 // ---- minimal JSON reading (json.c) ----
 // Finds key in the object that starts at obj (top level of it only); returns a pointer to the value or NULL.
