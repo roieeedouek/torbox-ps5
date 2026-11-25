@@ -58,7 +58,7 @@ package() {
     cp "$out/torbox-ps5.elf" "$pkg/"
     cp -r "$out/PPSA97630" "$pkg/"
     cp "$here/README.md" "$pkg/"
-    (cd "$out" && zip -qr "torbox-ps5-$version.zip" "torbox-ps5-$version")
+    (cd "$out" && python3 -I -m zipfile -c "torbox-ps5-$version.zip" "torbox-ps5-$version")
     echo "package: $pkg.zip"
 }
 
