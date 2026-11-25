@@ -128,3 +128,20 @@ long long json_int(const char *val, long long def) {
     long long v = strtoll(val, &end, 10);
     return end == val ? def : v;
 }
+
+const char *json_array_first(const char *arr) {
+    if (!arr) return NULL;
+    const char *p = ws(arr);
+    if (*p != '[') return NULL;
+    p = ws(p + 1);
+    return *p == ']' || !*p ? NULL : p;
+}
+
+const char *json_array_next(const char *elem) {
+    const char *p = skip_value(elem);
+    if (!p) return NULL;
+    p = ws(p);
+    if (*p != ',') return NULL;
+    p = ws(p + 1);
+    return *p ? p : NULL;
+}

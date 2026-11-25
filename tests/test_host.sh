@@ -16,7 +16,7 @@ python3 -I "$here/tests/mock_torbox.py" $mport > "$work/mock.log" 2>&1 &
 pids+=($!)
 for _ in $(seq 50); do curl -s -o /dev/null http://127.0.0.1:$mport/ && break; sleep 0.1; done
 start_app() {
-    TORBOX_API_BASE=http://127.0.0.1:$mport/v1/api TORBOX_APP_DIR=$work/app TORBOX_DOWNLOADS=$work/dl \
+    TORBOX_API_BASE=http://127.0.0.1:$mport/v1/api RD_API_BASE=http://127.0.0.1:$mport/rest/1.0 TORBOX_APP_DIR=$work/app TORBOX_DOWNLOADS=$work/dl \
         TORBOX_ROOTS=$work TORBOX_PORT=$port "$bin" >> "$work/app.log" 2>&1 &
     app_pid=$!
     pids+=($app_pid)
@@ -36,13 +36,13 @@ jq_() { python3 -I -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 
 check "UI page served" bash -c "curl -s $base/ | grep -q 'TorBox'"
 check "app.js served" bash -c "curl -s $base/app.js | grep -q loadStatus"
-check "not logged in at start" bash -c "[[ \$(curl -s $base/api/status | python3 -I -c 'import json,sys; print(json.load(sys.stdin)[\"logged_in\"])') == False ]]"
+check "not logged in at start" bash -c "[[ \$(curl -s $base/api/status | python3 -I -c 'import json,sys; print(json.load(sys.stdin)[\"providers\"][\"torbox\"][\"logged_in\"])') == False ]]"
 check "POST without app header refused" bash -c "[[ \$(curl -s -o /dev/null -w '%{http_code}' -d key=x $base/api/login) == 403 ]]"
 r=$(post login --data-urlencode key=wrong-key-123)
 check "wrong key refused" bash -c "grep -q 'invalid' <<<'$r'"
 check "wrong key not stored" test ! -e "$work/app/torbox-key.txt"
 r=$(post login --data-urlencode "key= test-key-0000 ")
-check "right key accepted" bash -c "grep -q '\"logged_in\":true' <<<'$r' && grep -q tester@example.com <<<'$r'"
+check "right key accepted" bash -c "grep -q '\"torbox\":{[^}]*\"logged_in\":true' <<<'$r' && grep -q tester@example.com <<<'$r'"
 check "key stored with mode 600" bash -c "[[ \$(stat -c %a $work/app/torbox-key.txt) == 600 ]]"
 check "key never in status" bash -c "! curl -s $base/api/status | grep -q test-key-0000"
 check "torrent list proxied" bash -c "curl -s '$base/api/list?kind=torrents&fresh=1' | grep -q 'Big Buck Bunny'"
@@ -139,6 +139,68 @@ check "resume with more connections splits segments ($conns)" test "$conns" -ge 
 check "split download finishes" wait_jobs 120
 check "steal.bin content" verify "$work/dl/g/steal.bin" $((64 * 1048576))
 post settings -d connections=6 > /dev/null
+
+# ---------- Real-Debrid ----------
+rdq() { curl -s "$base/api/rd/$1"; }
+r=$(post login -d provider=realdebrid --data-urlencode key=wrong-token-123)
+check "RD: bad token refused, readable" bash -c "grep -q 'bad or expired API token' <<<'$r'"
+r=$(post login -d provider=realdebrid --data-urlencode key=rd-test-token)
+check "RD: token accepted, user shown" bash -c "grep -q '\"realdebrid\":{[^}]*\"logged_in\":true' <<<'$r' && grep -q rdtester <<<'$r' && grep -q premium <<<'$r'"
+check "RD: TorBox still logged in" bash -c "grep -q '\"torbox\":{[^}]*\"logged_in\":true' <<<'$r'"
+check "RD: token stored separately (600)" bash -c "[[ \$(stat -c %a $work/app/realdebrid-token.txt) == 600 ]] && test -e $work/app/torbox-key.txt"
+check "RD: token never in status" bash -c "! curl -s $base/api/status | grep -q rd-test-token"
+r=$(rdq "torrents?page=1&limit=2")
+check "RD: paged torrents (page 1 of 5)" bash -c "python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d[\"total\"]==5 and len(d[\"data\"])==2 and d[\"data\"][0][\"id\"]==\"RDT1\"' '$r'"
+r=$(rdq "torrents?page=3&limit=2")
+check "RD: last page" bash -c "python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert len(d[\"data\"])==1 and d[\"data\"][0][\"id\"]==\"RDT5\"' '$r'"
+r=$(rdq "info?id=RDT1")
+check "RD: selected files paired with links" bash -c "python3 -I -c '
+import json,sys; d=json.loads(sys.argv[1]); f=d[\"files\"]
+assert d[\"paired\"] and [x[\"id\"] for x in f]==[1,3], f
+assert f[0][\"link\"].endswith(\"EPISODE1\") and f[1][\"link\"].endswith(\"SUBS1\") and d[\"links\"]==[]' '$r'"
+r=$(rdq "info?id=RDT2")
+check "RD: packed torrent gives its links apart" bash -c "python3 -I -c '
+import json,sys; d=json.loads(sys.argv[1])
+assert not d[\"paired\"] and len(d[\"files\"])==3 and all(x[\"link\"] is None for x in d[\"files\"]) and len(d[\"links\"])==1' '$r'"
+check "RD: history" bash -c "rdq() { curl -s $base/api/rd/\$1; }; rdq 'downloads?page=1' | grep -q history.iso"
+check "RD: bad id refused" bash -c "curl -s '$base/api/rd/info?id=../x' | grep -q 'bad torrent id'"
+curl -s "http://127.0.0.1:$mport/control?rd_429=2" > /dev/null
+check "RD: 429 waited out" bash -c "curl -s -m 30 '$base/api/rd/torrents?page=1' | grep -q RDT1"
+post settings -d connections=6 > /dev/null
+# Download all of RDT1 the way the page does: selected files with folder structure; one hoster link named by RD.
+post download -d kind=rd --data-urlencode "url=https://real-debrid.com/d/EPISODE1" -d name=e01.mkv \
+    --data-urlencode "subdir=Show S01" --data-urlencode "folder=$work/dl/rd" > /dev/null
+post download -d kind=rd --data-urlencode "url=https://real-debrid.com/d/SUBS1" -d name=e01.srt \
+    --data-urlencode "subdir=Show S01/Subs" --data-urlencode "folder=$work/dl/rd" > /dev/null
+post download -d kind=rd --data-urlencode "url=https://real-debrid.com/d/PACKED" -d name= \
+    --data-urlencode "folder=$work/dl/rd" > /dev/null
+post download -d kind=rd --data-urlencode "url=https://unsupported.example/file/1" -d name= \
+    --data-urlencode "folder=$work/dl/rd" > /dev/null
+check "RD: downloads finish" wait_jobs 120
+check "RD: e01.mkv content" verify "$work/dl/rd/Show S01/e01.mkv" $((20 * 1048576))
+check "RD: e01.srt in Subs" verify "$work/dl/rd/Show S01/Subs/e01.srt" $((3 * 1048576))
+check "RD: unnamed link named by Real-Debrid" verify "$work/dl/rd/Packed.rar" $((5 * 1048576))
+check "RD: unsupported hoster fails readably" bash -c "curl -s $base/api/jobs | grep -q 'unsupported hoster'"
+# A direct link that expires while the download is paused: resumed with a fresh unrestrict, not restarted.
+curl -s "http://127.0.0.1:$mport/control?rd_ttl=4" > /dev/null
+id=$(post download -d kind=rd --data-urlencode "url=https://real-debrid.com/d/SLOW" -d name=slow-rd.bin \
+    --data-urlencode "folder=$work/dl/rd2" | jq_ 'd["id"]')
+sleep 3
+post jobs/pause -d id="$id" > /dev/null
+sleep 1.5
+before=$(get jobs | jq_ "[j['done'] for j in d['jobs'] if j['id']==$id][0]")
+sleep 4
+post jobs/resume -d id="$id" > /dev/null
+check "RD: expired link download finishes" wait_jobs 120
+check "RD: slow-rd.bin content" verify "$work/dl/rd2/slow-rd.bin" $((40 * 1048576))
+n=$(curl -s "http://127.0.0.1:$mport/control/stats" | jq_ 'd["unrestrict"]["https://real-debrid.com/d/SLOW"]')
+check "RD: expired link unrestricted again ($n calls, $before bytes kept)" bash -c "test $n -ge 2 && test $before -gt 1000000"
+curl -s "http://127.0.0.1:$mport/control?rd_ttl=600" > /dev/null
+check "RD: queue file has no direct links" bash -c "! grep -q rdfile $work/app/queue.tsv"
+r=$(post logout -d provider=realdebrid)
+check "RD: logout keeps TorBox" bash -c "test ! -e $work/app/realdebrid-token.txt && test -e $work/app/torbox-key.txt"
+check "RD: lists refused after logout" bash -c "curl -s '$base/api/rd/torrents' | grep -q 'not logged in'"
+check "RD: token and direct links not in logs" bash -c "! grep -rqE 'rd-test-token|rdfile' $work/app/log.txt $work/app.log"
 
 # Cancel deletes the partial file.
 id=$(post download -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((48 * 1048576))?rate=2000000" \

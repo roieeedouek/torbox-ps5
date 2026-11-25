@@ -1,8 +1,28 @@
-// TorBox for PS5 web UI. Talks only to the console; the console talks to TorBox.
+// TorBox for PS5 web UI. Talks only to the console; the console talks to TorBox and Real-Debrid.
 "use strict";
 
 const $ = (s) => document.querySelector(s);
-const state = { tab: "torrents", lists: {}, open: new Set(), status: null, jobs: [], pollTimer: 0 };
+const PROVIDERS = {
+  torbox: {
+    title: "TorBox", keyName: "API key",
+    help: "Paste your TorBox API key (torbox.app, Settings, API Key).",
+    tabs: [["torrents", "Torrents"], ["webdl", "Web"], ["usenet", "Usenet"]],
+  },
+  realdebrid: {
+    title: "Real-Debrid", keyName: "API token",
+    help: "Paste your Real-Debrid private API token (real-debrid.com/apitoken, while logged in there).",
+    tabs: [["rd-torrents", "Torrents"], ["rd-history", "History"]],
+  },
+};
+function loadPref(k, d) { try { return localStorage.getItem(k) || d; } catch (e) { return d; } }
+function savePref(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* private mode */ } }
+
+const hashProvider = location.hash.slice(1); // #torbox or #realdebrid picks the service (bookmarks)
+const state = {
+  provider: PROVIDERS[hashProvider] ? hashProvider : PROVIDERS[loadPref("provider", "")] ? loadPref("provider", "") : "torbox",
+  tab: { torbox: "torrents", realdebrid: "rd-torrents" },
+  lists: {}, open: new Set(), rdInfo: {}, status: null, jobs: [], pollTimer: 0,
+};
 
 function el(tag, props, ...children) {
   const e = document.createElement(tag);
@@ -55,8 +75,16 @@ function duration(s) {
   if (s < 3600) return Math.floor(s / 60) + "m " + (s % 60) + "s";
   return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
 }
+const curTab = () => state.tab[state.provider];
+const prov = () => state.status && state.status.providers[state.provider];
 
-// ---------- login ----------
+// ---------- providers, login ----------
+document.querySelectorAll("#providers button").forEach((b) => b.addEventListener("click", () => {
+  state.provider = b.dataset.provider; savePref("provider", state.provider);
+  history.replaceState(null, "", "#" + state.provider);
+  render();
+}));
+
 async function loadStatus() {
   try {
     state.status = await api("status");
@@ -66,20 +94,46 @@ async function loadStatus() {
     return;
   }
   setConn(true);
-  const s = state.status;
-  $("#key-file").textContent = s.key_file;
-  if (!$("#folder").value) $("#folder").value = localStorage.getItem("folder") || s.default_folder;
-  if (!s.logged_in) {
+  if (!$("#folder").value) $("#folder").value = loadPref("folder", state.status.default_folder);
+  render();
+  pollJobs();
+}
+
+function accountText(id) {
+  const p = state.status.providers[id], u = p.user;
+  if (!u) return "Logged in" + (p.user_error ? " (" + p.user_error + ")" : "");
+  if (id === "realdebrid") {
+    const prem = u.type === "premium";
+    return "Logged in as " + u.name + " · " + (prem ? "premium" + (u.expires ? " until " + u.expires.slice(0, 10) : "") : u.type + " account (downloads need premium)");
+  }
+  return "Logged in as " + u.name + (u.expires ? " · plan until " + u.expires.slice(0, 10) : "");
+}
+
+function render() {
+  const s = state.status, P = PROVIDERS[state.provider], p = prov();
+  document.querySelectorAll("#providers button").forEach((b) => {
+    b.classList.toggle("active", b.dataset.provider === state.provider);
+    b.replaceChildren(PROVIDERS[b.dataset.provider].title,
+      s.providers[b.dataset.provider].logged_in ? el("span", { class: "dot", title: "logged in" }) : "");
+  });
+  if (!p.logged_in) {
     $("#login").classList.remove("hidden"); $("#app").classList.add("hidden");
-    $("#key").focus();
+    $("#login-title").textContent = "Log in to " + P.title;
+    $("#login-help").textContent = P.help;
+    $("#key").placeholder = P.keyName;
+    $("#key-file").textContent = p.key_file;
+    $("#login-error").textContent = "";
     return;
   }
   $("#login").classList.add("hidden"); $("#app").classList.remove("hidden");
-  const u = s.user;
-  $("#account").textContent = (u ? "Logged in as " + u.email + (u.premium_expires_at ? " · plan until " + u.premium_expires_at.slice(0, 10) : "") :
-    "Logged in" + (s.user_error ? " (" + s.user_error + ")" : "")) + " · " + s.mode + " " + s.version;
-  showTab(state.tab);
-  pollJobs();
+  $("#account").textContent = P.title + ": " + accountText(state.provider) + " · " + s.mode + " " + s.version;
+  $("#logout").textContent = "Log out of " + P.title;
+  $("#url-rd-wrap").classList.toggle("hidden", !s.providers.realdebrid.logged_in);
+  $("#url-rd").checked = state.provider === "realdebrid";
+  $("#tabs").replaceChildren(...P.tabs.map(([id, label]) => el("button", { "data-tab": id, onclick: () => showTab(id) }, label)),
+    el("button", { "data-tab": "downloads", onclick: () => showTab("downloads") }, "Downloads ", el("span", { id: "badge", class: "badge hidden" }, "0")));
+  showTab(curTab());
+  updateBadge();
 }
 
 $("#login-form").addEventListener("submit", async (ev) => {
@@ -88,8 +142,9 @@ $("#login-form").addEventListener("submit", async (ev) => {
   $("#login-error").textContent = "";
   btn.disabled = true; btn.textContent = "Checking...";
   try {
-    await api("login", { key: input.value.trim() });
+    await api("login", { provider: state.provider, key: input.value.trim() });
     input.value = "";
+    state.lists = {}; state.rdInfo = {};
     await loadStatus();
   } catch (e) {
     $("#login-error").textContent = e.message;
@@ -99,9 +154,11 @@ $("#login-form").addEventListener("submit", async (ev) => {
 });
 
 $("#logout").addEventListener("click", async () => {
-  if (!confirm("Log out and delete the stored API key from the console?")) return;
-  await api("logout", {}).catch((e) => toast(e.message));
-  state.lists = {};
+  const P = PROVIDERS[state.provider];
+  if (!confirm("Log out of " + P.title + " and delete its stored " + P.keyName + " from the console?")) return;
+  await api("logout", { provider: state.provider }).catch((e) => toast(e.message));
+  for (const k of Object.keys(state.lists)) if (k.startsWith(state.provider === "realdebrid" ? "rd-" : "") === (state.provider === "realdebrid")) delete state.lists[k];
+  state.rdInfo = {};
   loadStatus();
 });
 
@@ -115,11 +172,9 @@ $("#quit").addEventListener("click", async () => {
 });
 
 // ---------- tabs and lists ----------
-document.querySelectorAll(".tabs button").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
-
 function showTab(tab) {
-  state.tab = tab;
-  document.querySelectorAll(".tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+  state.tab[state.provider] = tab;
+  document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   const dl = tab === "downloads";
   $("#list-view").classList.toggle("hidden", dl);
   $("#downloads-view").classList.toggle("hidden", !dl);
@@ -128,57 +183,70 @@ function showTab(tab) {
   else loadList(false);
 }
 
-async function loadList(fresh) {
-  const tab = state.tab;
-  $("#list-status").textContent = "Loading...";
-  $("#items").replaceChildren();
+// Real-Debrid lists come in pages; a list keeps {items, total, page}.
+async function loadList(fresh, more) {
+  const tab = curTab();
+  const rd = tab.startsWith("rd-");
+  const old = state.lists[tab];
+  if (!more) { $("#list-status").textContent = "Loading..."; $("#items").replaceChildren(); $("#more").classList.add("hidden"); }
   try {
-    const r = await api("list?kind=" + tab + (fresh ? "&fresh=1" : ""));
-    let data = r.data || [];
-    if (!Array.isArray(data)) data = [data];
-    data.sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
-    state.lists[tab] = data;
+    if (rd) {
+      const page = more && old ? old.page + 1 : 1;
+      const r = await api("rd/" + (tab === "rd-torrents" ? "torrents" : "downloads") + "?limit=100&page=" + page);
+      const items = (more && old ? old.items : []).concat(Array.isArray(r.data) ? r.data : []);
+      state.lists[tab] = { items, total: r.total >= 0 ? r.total : items.length, page };
+    } else {
+      const r = await api("list?kind=" + tab + (fresh ? "&fresh=1" : ""));
+      let data = r.data || [];
+      if (!Array.isArray(data)) data = [data];
+      data.sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+      state.lists[tab] = { items: data, total: data.length, page: 1 };
+    }
   } catch (e) {
-    if (e.status === 401 && e.data && e.data.error === "not logged in") return loadStatus();
-    state.lists[tab] = null;
+    if (e.status === 401) return loadStatus();
+    if (!more) state.lists[tab] = null;
     $("#list-status").textContent = "Could not load the list: " + e.message;
     return;
   }
-  if (tab === state.tab) renderList();
+  if (tab === curTab()) renderList();
 }
 
-$("#refresh").addEventListener("click", () => loadList(true));
+$("#refresh").addEventListener("click", () => {
+  if (curTab().startsWith("rd-")) state.rdInfo = {};
+  loadList(true);
+});
+$("#more").addEventListener("click", () => loadList(false, true));
 $("#filter").addEventListener("input", () => renderList());
 
-function itemState(it) {
-  const s = String(it.download_state || "");
-  if (it.download_present || it.download_finished) return { text: s && !/^(completed|cached|uploading|seeding)/i.test(s) ? s : "ready", cls: "ready", ready: true };
-  if (/error|fail|stalled|dead/i.test(s)) return { text: s, cls: "bad", ready: false };
-  const p = typeof it.progress === "number" ? " " + Math.round(it.progress * 100) + "%" : "";
-  return { text: (s || "processing") + p, cls: "busy", ready: false };
-}
-
 function renderList() {
-  const items = state.lists[state.tab] || [];
+  const tab = curTab(), L = state.lists[tab] || { items: [], total: 0 };
+  const items = L.items;
+  const name = (it) => String(it.name || it.filename || "");
   const q = $("#filter").value.trim().toLowerCase();
-  const shown = q ? items.filter((it) => String(it.name || "").toLowerCase().includes(q)) : items;
-  $("#list-status").textContent = items.length ? (shown.length === items.length ? items.length + " item(s)" : shown.length + " of " + items.length) :
-    "Nothing here yet. Add downloads on torbox.app, then press Refresh.";
-  $("#items").replaceChildren(...shown.slice(0, 300).map(renderItem));
+  const shown = q ? items.filter((it) => name(it).toLowerCase().includes(q)) : items;
+  const more = L.total > items.length;
+  $("#list-status").textContent = items.length ?
+    (shown.length === items.length ? items.length + (more ? " of " + L.total : "") + " item(s)" : shown.length + " of " + items.length) :
+    tab.startsWith("rd-") ? "Nothing here yet. Add torrents on real-debrid.com, then press Refresh." :
+      "Nothing here yet. Add downloads on torbox.app, then press Refresh.";
+  const render = tab === "rd-torrents" ? renderRdTorrent : tab === "rd-history" ? renderRdHistory : renderItem;
+  $("#items").replaceChildren(...shown.slice(0, 500).map(render));
+  $("#more").classList.toggle("hidden", !more);
+  $("#more").textContent = "Load more (" + (L.total - items.length) + " left)";
 }
 
 function folder() {
   const f = $("#folder").value.trim().replace(/\/+$/, "");
-  localStorage.setItem("folder", f);
+  savePref("folder", f);
   return f;
 }
 
-function relDir(file) {
-  // TorBox file names carry the item's folder structure ("Name/sub/file.ext"); keep it for whole-item downloads.
-  const n = String(file.name || "");
+function dirOf(path) {
+  const n = String(path || "").replace(/^\/+/, "");
   const i = n.lastIndexOf("/");
   return i > 0 ? n.slice(0, i) : "";
 }
+function baseOf(path) { return String(path || "").split("/").pop(); }
 
 async function queue(jobs) {
   const f = folder();
@@ -191,36 +259,116 @@ async function queue(jobs) {
   pollJobs();
 }
 
+function itemCard(title, metaParts, actions, extra) {
+  return el("div", { class: "item" },
+    el("div", { class: "item-name" }, title || "(no name)"),
+    el("div", { class: "meta" }, metaParts),
+    el("div", { class: "actions" }, actions), extra);
+}
+
+function itemState(it) {
+  const s = String(it.download_state || "");
+  if (it.download_present || it.download_finished) return { text: s && !/^(completed|cached|uploading|seeding)/i.test(s) ? s : "ready", cls: "ready", ready: true };
+  if (/error|fail|stalled|dead/i.test(s)) return { text: s, cls: "bad", ready: false };
+  const p = typeof it.progress === "number" ? " " + Math.round(it.progress * 100) + "%" : "";
+  return { text: (s || "processing") + p, cls: "busy", ready: false };
+}
+
+// TorBox item (torrent, web download, usenet).
 function renderItem(it) {
-  const st = itemState(it);
+  const tab = curTab(), st = itemState(it);
   const files = Array.isArray(it.files) ? it.files : [];
-  const key = state.tab + ":" + it.id;
-  const open = state.open.has(key);
-  const fileJob = (f, withDir) => ({ kind: state.tab, id: it.id, file_id: f.id, name: f.short_name || String(f.name || "").split("/").pop(),
-    subdir: withDir ? (relDir(f) || it.name) : "" });
-  const box = el("div", { class: "item" },
-    el("div", { class: "item-head" },
-      el("div", { class: "grow" },
-        el("div", { class: "item-name" }, it.name || "(no name)"),
-        el("div", { class: "meta" },
-          el("span", { class: "state " + st.cls }, st.text),
-          el("span", {}, size(it.size)),
-          el("span", {}, files.length + " file" + (files.length === 1 ? "" : "s")),
-          it.created_at ? el("span", {}, String(it.created_at).slice(0, 10)) : null))),
-    el("div", { class: "actions" },
-      files.length ? el("button", { class: "small", type: "button", onclick: () => { open ? state.open.delete(key) : state.open.add(key); renderList(); } },
-        open ? "Hide files" : "Show files") : null,
-      el("button", { class: "small primary", type: "button", disabled: !st.ready || !files.length,
-        onclick: () => queue(files.map((f) => fileJob(f, true))) }, files.length > 1 ? "Download all files" : "Download"),
-      files.length > 1 ? el("button", { class: "small", type: "button", disabled: !st.ready,
-        onclick: () => queue([{ kind: state.tab, id: it.id, file_id: "", name: (it.name || "download") + ".zip" }]) }, "As one ZIP") : null));
-  if (open) {
-    box.append(el("ul", { class: "files" }, files.map((f) => el("li", {},
-      el("span", { class: "fname" }, f.short_name || f.name),
-      el("span", { class: "fsize" }, size(f.size)),
-      el("button", { class: "small", type: "button", disabled: !st.ready, onclick: () => queue([fileJob(f, false)]) }, "Download")))));
+  const key = tab + ":" + it.id, open = state.open.has(key);
+  const fileJob = (f, withDir) => ({ kind: tab, id: it.id, file_id: f.id, name: f.short_name || baseOf(f.name),
+    subdir: withDir ? (dirOf(f.name) || it.name) : "" });
+  return itemCard(it.name, [
+    el("span", { class: "state " + st.cls }, st.text), el("span", {}, size(it.size)),
+    el("span", {}, files.length + " file" + (files.length === 1 ? "" : "s")),
+    it.created_at ? el("span", {}, String(it.created_at).slice(0, 10)) : null,
+  ], [
+    files.length ? el("button", { class: "small", type: "button", onclick: () => { open ? state.open.delete(key) : state.open.add(key); renderList(); } },
+      open ? "Hide files" : "Show files") : null,
+    el("button", { class: "small primary", type: "button", disabled: !st.ready || !files.length,
+      onclick: () => queue(files.map((f) => fileJob(f, true))) }, files.length > 1 ? "Download all files" : "Download"),
+    files.length > 1 ? el("button", { class: "small", type: "button", disabled: !st.ready,
+      onclick: () => queue([{ kind: tab, id: it.id, file_id: "", name: (it.name || "download") + ".zip" }]) }, "As one ZIP") : null,
+  ], open ? el("ul", { class: "files" }, files.map((f) => el("li", {},
+    el("span", { class: "fname" }, f.short_name || f.name), el("span", { class: "fsize" }, size(f.size)),
+    el("button", { class: "small", type: "button", disabled: !st.ready, onclick: () => queue([fileJob(f, false)]) }, "Download")))) : null);
+}
+
+// ---------- Real-Debrid ----------
+async function rdInfo(id) {
+  if (!state.rdInfo[id]) state.rdInfo[id] = await api("rd/info?id=" + encodeURIComponent(id));
+  return state.rdInfo[id];
+}
+
+// Jobs for a torrent: each selected file with its link (folder structure from the file paths), or, when
+// Real-Debrid packed the files, its links (named by Real-Debrid when they start).
+function rdJobs(info, files, withDir) {
+  const top = info.filename || "download";
+  if (!info.paired) return info.links.map((link) => ({ kind: "rd", url: link, name: "", subdir: withDir ? top : "" }));
+  // Paths may or may not start with the torrent's own folder: add it only when it is missing.
+  const inTop = info.files.every((f) => String(f.path).replace(/^\/+/, "").startsWith(top + "/"));
+  const dirFor = (f) => {
+    const d = dirOf(f.path);
+    if (inTop || info.files.length === 1) return d;
+    return top + (d ? "/" + d : "");
+  };
+  return files.filter((f) => f.link).map((f) => ({ kind: "rd", url: f.link, name: baseOf(f.path),
+    subdir: withDir ? dirFor(f) : "" }));
+}
+
+function renderRdTorrent(t) {
+  const key = "rd:" + t.id, open = state.open.has(key), info = state.rdInfo[t.id];
+  const ready = t.status === "downloaded";
+  const bad = /error|virus|dead/.test(t.status);
+  const stText = ready ? "ready" : t.status + (t.status === "downloading" ? " " + t.progress + "%" : "");
+  const toggle = async () => {
+    if (open) { state.open.delete(key); return renderList(); }
+    try { await rdInfo(t.id); state.open.add(key); renderList(); } catch (e) { toast(e.message); }
+  };
+  const all = async () => {
+    try { const i = await rdInfo(t.id); queue(rdJobs(i, i.files, true)); } catch (e) { toast(e.message); }
+  };
+  let extra = null;
+  if (open && info) {
+    const rows = info.files.map((f) => el("li", {},
+      el("span", { class: "fname" }, String(f.path).replace(/^\//, "")), el("span", { class: "fsize" }, size(f.bytes)),
+      info.paired ? el("button", { class: "small", type: "button", disabled: !ready || !f.link,
+        onclick: () => queue(rdJobs(info, [f], false)) }, "Download") : null));
+    extra = el("div", {}, el("ul", { class: "files" }, rows),
+      !info.paired && info.links.length ? el("div", {}, el("p", { class: "links-note" },
+        "Real-Debrid packed these files into " + info.links.length + " link(s); each is named by Real-Debrid when it starts:"),
+      el("ul", { class: "files" }, info.links.map((link, i) => el("li", {}, el("span", { class: "fname" }, "Link " + (i + 1)),
+        el("button", { class: "small", type: "button", disabled: !ready, onclick: () => queue([{ kind: "rd", url: link, name: "", subdir: "" }]) }, "Download"))))) : null);
   }
-  return box;
+  return itemCard(t.filename, [
+    el("span", { class: "state " + (ready ? "ready" : bad ? "bad" : "busy") }, stText), el("span", {}, size(t.bytes)),
+    el("span", {}, (t.links || []).length + " link" + ((t.links || []).length === 1 ? "" : "s")),
+    t.added ? el("span", {}, String(t.added).slice(0, 10)) : null,
+  ], [
+    el("button", { class: "small", type: "button", onclick: toggle }, open ? "Hide files" : "Show files"),
+    el("button", { class: "small primary", type: "button", disabled: !ready || !(t.links || []).length, onclick: all },
+      (t.links || []).length > 1 ? "Download all files" : "Download"),
+  ], extra);
+}
+
+function renderRdHistory(d) {
+  return itemCard(d.filename, [
+    el("span", {}, size(d.filesize)), d.host ? el("span", {}, d.host) : null,
+    d.generated ? el("span", {}, String(d.generated).slice(0, 10)) : null,
+  ], [
+    el("button", { class: "small primary", type: "button", disabled: !d.link,
+      onclick: () => queue([{ kind: "rd", url: d.link, name: d.filename || "" }]) }, "Download"),
+  ]);
+}
+
+function updateBadge() {
+  const active = state.jobs.filter((j) => ["queued", "starting", "downloading"].includes(j.state)).length;
+  const badge = $("#badge");
+  if (badge) { badge.textContent = active; badge.classList.toggle("hidden", !active); }
+  return active;
 }
 
 // ---------- downloads ----------
@@ -233,11 +381,9 @@ async function pollJobs() {
     $("#parallel").value = String(r.parallel);
     if (!$("#connections").value) $("#connections").append(el("option", {}, String(r.connections))), $("#connections").value = String(r.connections);
   } catch (e) { /* offline: retry below */ }
-  const active = state.jobs.filter((j) => ["queued", "starting", "downloading"].includes(j.state)).length;
-  const badge = $("#badge");
-  badge.textContent = active; badge.classList.toggle("hidden", !active);
-  if (state.tab === "downloads") renderJobs();
-  state.pollTimer = setTimeout(pollJobs, state.tab === "downloads" || active ? 1000 : 5000);
+  const active = updateBadge();
+  if (curTab() === "downloads") renderJobs();
+  state.pollTimer = setTimeout(pollJobs, curTab() === "downloads" || active ? 1000 : 5000);
 }
 
 function jobAction(action, id) {
@@ -288,7 +434,8 @@ $("#url-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
   const u = $("#url").value.trim();
   if (!u) return;
-  queue([{ kind: "url", url: u }]).then(() => { $("#url").value = ""; });
+  const viaRd = !$("#url-rd-wrap").classList.contains("hidden") && $("#url-rd").checked;
+  queue([viaRd ? { kind: "rd", url: u, name: "" } : { kind: "url", url: u }]).then(() => { $("#url").value = ""; });
 });
 
 // ---------- folder picker ----------

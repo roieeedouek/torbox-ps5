@@ -46,21 +46,46 @@ const char *json_find(const char *obj, const char *key);
 int json_string(const char *val, char *out, size_t len); // 0 on success
 int json_bool(const char *val);                          // 1 true, 0 false, -1 not a bool
 long long json_int(const char *val, long long def);
+const char *json_array_first(const char *arr); // first element of the array at arr, or NULL
+const char *json_array_next(const char *elem); // element after elem, or NULL
 
-// ---- TorBox API (torbox.c) ----
+// ---- providers, stored keys and HTTPS (net.c) ----
+enum { PROV_TORBOX, PROV_RD, PROV_COUNT };
+typedef struct {
+    const char *id, *title, *key_file;
+} provider;
+extern const provider providers[PROV_COUNT];
+int prov_find(const char *id); // -1 if unknown
+const char *cred_path(int prov);
+int cred_get(int prov, char *out, size_t len); // 0 = stored key copied out
+int cred_set(int prov, const char *key);
+void cred_clear(int prov);
+void net_apply(void *curl_handle); // CA bundle, socket tuning and common options for every curl handle
+// method "GET" or "POST" (form = x-www-form-urlencoded body); bearer may be NULL; total gets X-Total-Count (or -1).
+// Returns the HTTP status, 0 on a transport error (err set).
+int net_request(const char *method, const char *url, const char *bearer, const char *form, sbuf *body,
+                long long *total, char *err, size_t errlen);
+
+// ---- TorBox (torbox.c) ----
 void tb_init(void);
-int tb_have_key(void);
-int tb_get_key(char *out, size_t len);
-int tb_set_key(const char *key);
-void tb_clear_key(void);
-const char *tb_key_path(void);
-// GET <base>/<path_and_query> with the Bearer key. Returns HTTP status (0 on transport error, err set).
 int tb_get(const char *path_and_query, const char *key, sbuf *body, char *err, size_t errlen);
+// Validates key with user/me: 1 valid (user gets {"name","plan","expires"}), 0 refused, -1 could not ask.
+int tb_check_key(const char *key, sbuf *user, char *err, size_t errlen);
 // Requests a download link. kind: "torrents", "webdl", "usenet". file_id < 0 = zip of the item.
 int tb_request_link(const char *kind, long long item_id, long long file_id, char *url, size_t urllen, char *err,
                     size_t errlen);
-void tb_apply_tls(void *curl_handle); // CA bundle and common options for every curl handle
-const char *tb_api_base(void);
+
+// ---- Real-Debrid (realdebrid.c) ----
+void rd_init(void);
+// Validates key with /user: 1 valid (user gets {"name","type","expires","premium_seconds"}), 0 refused, -1 error.
+int rd_check_key(const char *key, sbuf *user, char *err, size_t errlen);
+// what: "torrents" or "downloads". out gets {"ok":true,"page","total","data":[...]}. Returns the HTTP status.
+int rd_list(const char *what, int page, int limit, sbuf *out, char *err, size_t errlen);
+// out gets the torrent with selected files paired to their links. Returns the HTTP status.
+int rd_info(const char *id, sbuf *out, char *err, size_t errlen);
+// Hoster link -> direct download URL (+ file name, max chunks). *permanent: retrying will not help.
+int rd_unrestrict(const char *link, char *url, size_t urllen, char *name, size_t namelen, int *chunks, int *permanent,
+                  char *err, size_t errlen);
 
 // ---- downloads (dl.c) ----
 void dl_init(int workers);

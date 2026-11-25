@@ -11,6 +11,7 @@ int sceSystemServiceLoadExec(const char *path, char *const argv[]);
 int torbox_main(void) {
     plat_init();
     tb_init();
+    rd_init();
     plat_log("TorBox for PS5 %s (%s) starting, data in %s", APP_VERSION, plat_mode(), plat_app_dir());
     dl_init(3);
     int port = APP_PORT;

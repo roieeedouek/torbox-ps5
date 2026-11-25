@@ -78,3 +78,10 @@ code { font-size: 13px; overflow-wrap: anywhere; }
 .dirs li.empty { color: var(--muted); cursor: default; }
 .toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 10px; max-width: calc(100% - 32px); z-index: 20; font-size: 14px; }
 .dirs li.file { display: flex; gap: 8px; cursor: default; color: var(--muted); font-size: 14px; }
+.providers { display: flex; gap: 0; margin: 4px 0 10px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; width: fit-content; }
+.providers button { border: 0; border-radius: 0; padding: 8px 16px; background: var(--card); color: var(--muted); }
+.providers button.active { background: var(--accent); color: var(--accent-text); font-weight: 600; }
+.providers button .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: currentColor; margin-left: 6px; vertical-align: middle; opacity: .8; }
+.check { display: flex; gap: 8px; align-items: center; font-size: 14px; color: var(--muted); margin-top: 8px; }
+#more { display: block; margin: 10px auto; }
+.links-note { font-size: 13px; color: var(--muted); margin: 10px 0 4px; }

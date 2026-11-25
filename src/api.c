@@ -11,7 +11,7 @@
 #include <sys/statvfs.h>
 
 static pthread_mutex_t g_user_lock = PTHREAD_MUTEX_INITIALIZER;
-static char g_user_json[1024]; // cached {"email":..,"plan":..} of the logged-in account, "" = unknown
+static char g_user_json[PROV_COUNT][1024]; // cached account summary per provider, "" = unknown
 
 static void json_err(int fd, int status, const char *msg) {
     sbuf b;
@@ -28,108 +28,116 @@ static void json_ok(int fd) {
     http_send_json(fd, 200, &b);
 }
 
-// Calls user/me with key; on success fills g_user_json. Returns 1 valid, 0 refused, -1 could not ask.
-static int check_key(const char *key, char *err, size_t errlen) {
-    sbuf b;
-    sb_init(&b);
-    int status = tb_get("user/me", key, &b, err, errlen);
-    int rc = -1;
-    if (status == 200 && b.data && json_bool(json_find(b.data, "success")) == 1) {
-        const char *d = json_find(b.data, "data");
-        char email[200] = "", expires[64] = "";
-        json_string(json_find(d, "email"), email, sizeof email);
-        json_string(json_find(d, "premium_expires_at"), expires, sizeof expires);
-        long long plan = json_int(json_find(d, "plan"), -1);
-        sbuf u;
-        sb_init(&u);
-        sb_puts(&u, "{\"email\":");
-        sb_json_str(&u, email);
-        sb_printf(&u, ",\"plan\":%lld,\"premium_expires_at\":", plan);
-        sb_json_str(&u, expires);
-        sb_puts(&u, "}");
+// Validates key with the provider; on success caches the account summary. 1 valid, 0 refused, -1 could not ask.
+static int check_key(int p, const char *key, char *err, size_t errlen) {
+    sbuf u;
+    sb_init(&u);
+    int rc = p == PROV_RD ? rd_check_key(key, &u, err, errlen) : tb_check_key(key, &u, err, errlen);
+    if (rc == 1) {
         pthread_mutex_lock(&g_user_lock);
-        snprintf(g_user_json, sizeof g_user_json, "%s", u.data);
+        snprintf(g_user_json[p], sizeof g_user_json[p], "%s", u.data ? u.data : "{}");
         pthread_mutex_unlock(&g_user_lock);
-        sb_free(&u);
-        rc = 1;
-    } else if (status) {
-        char detail[300] = "";
-        if (b.data) json_string(json_find(b.data, "detail"), detail, sizeof detail);
-        snprintf(err, errlen, "%s", detail[0] ? detail : "TorBox refused the key");
-        rc = status == 401 || status == 403 ? 0 : -1;
-        if (rc && !detail[0]) snprintf(err, errlen, "TorBox answered HTTP %d", status);
-    }
-    sb_free(&b);
+    } else if (!err[0]) snprintf(err, errlen, "%s refused the key", providers[p].title);
+    sb_free(&u);
     return rc;
 }
 
+// The provider a request names (?provider= or form field), TorBox when none is given.
+static int req_provider(http_req *r) {
+    char id[32];
+    if (!form_get(r->query, "provider", id, sizeof id) && !(r->body && form_get(r->body, "provider", id, sizeof id)))
+        return PROV_TORBOX;
+    return prov_find(id);
+}
+
 static void route_status(http_req *r) {
-    char key[256], ip[64], err[300] = "";
-    int logged = tb_get_key(key, sizeof key) == 0;
-    pthread_mutex_lock(&g_user_lock);
-    int known = g_user_json[0] != 0;
-    pthread_mutex_unlock(&g_user_lock);
-    if (logged && !known) check_key(key, err, sizeof err);
-    memset(key, 0, sizeof key);
+    char key[256], ip[64], err[PROV_COUNT][300];
+    int logged[PROV_COUNT];
+    for (int p = 0; p < PROV_COUNT; p++) {
+        err[p][0] = 0;
+        logged[p] = cred_get(p, key, sizeof key) == 0;
+        pthread_mutex_lock(&g_user_lock);
+        int known = g_user_json[p][0] != 0;
+        pthread_mutex_unlock(&g_user_lock);
+        if (logged[p] && !known) check_key(p, key, err[p], sizeof err[p]);
+        memset(key, 0, sizeof key);
+    }
     plat_local_ip(ip, sizeof ip);
     sbuf b;
     sb_init(&b);
-    sb_printf(&b, "{\"ok\":true,\"version\":\"%s\",\"mode\":\"%s\",\"logged_in\":%s,\"ip\":\"%s\",\"port\":%d,",
-              APP_VERSION, plat_mode(), logged ? "true" : "false", ip, APP_PORT);
-    sb_puts(&b, "\"key_file\":");
-    sb_json_str(&b, tb_key_path());
-    sb_puts(&b, ",\"default_folder\":");
+    sb_printf(&b, "{\"ok\":true,\"version\":\"%s\",\"mode\":\"%s\",\"ip\":\"%s\",\"port\":%d,\"default_folder\":",
+              APP_VERSION, plat_mode(), ip, APP_PORT);
     sb_json_str(&b, plat_default_folder());
-    pthread_mutex_lock(&g_user_lock);
-    sb_printf(&b, ",\"user\":%s", logged && g_user_json[0] ? g_user_json : "null");
-    pthread_mutex_unlock(&g_user_lock);
-    sb_puts(&b, ",\"user_error\":");
-    sb_json_str(&b, err);
-    sb_puts(&b, "}");
+    sb_puts(&b, ",\"providers\":{");
+    for (int p = 0; p < PROV_COUNT; p++) {
+        sb_printf(&b, "%s\"%s\":{\"title\":\"%s\",\"logged_in\":%s,\"key_file\":", p ? "," : "", providers[p].id,
+                  providers[p].title, logged[p] ? "true" : "false");
+        sb_json_str(&b, cred_path(p));
+        pthread_mutex_lock(&g_user_lock);
+        sb_printf(&b, ",\"user\":%s", logged[p] && g_user_json[p][0] ? g_user_json[p] : "null");
+        pthread_mutex_unlock(&g_user_lock);
+        sb_puts(&b, ",\"user_error\":");
+        sb_json_str(&b, err[p]);
+        sb_puts(&b, "}");
+    }
+    sb_puts(&b, "}}");
     http_send_json(r->fd, 200, &b);
     sb_free(&b);
 }
 
 static void route_login(http_req *r) {
+    int p = req_provider(r);
+    if (p < 0) {
+        json_err(r->fd, 400, "unknown provider");
+        return;
+    }
     char key[256], err[300] = "";
     form_get(r->body, "key", key, sizeof key);
-    // Keys are UUID-like; trim spaces a paste may bring.
+    // Tokens are plain ASCII; trim spaces a paste may bring.
     char *k = key;
     while (*k == ' ' || *k == '\t') k++;
     size_t n = strlen(k);
     while (n && (k[n - 1] == ' ' || k[n - 1] == '\t' || k[n - 1] == '\r' || k[n - 1] == '\n')) k[--n] = 0;
-    for (char *p = k; *p; p++)
-        if (*p < 0x21 || *p > 0x7e) {
+    for (char *c = k; *c; c++)
+        if (*c < 0x21 || *c > 0x7e) {
             memset(key, 0, sizeof key);
             json_err(r->fd, 400, "the key has unexpected characters");
             return;
         }
     if (n < 8) {
-        json_err(r->fd, 400, "paste your TorBox API key");
+        char msg[100];
+        snprintf(msg, sizeof msg, "paste your %s API %s", providers[p].title, p == PROV_RD ? "token" : "key");
+        json_err(r->fd, 400, msg);
         return;
     }
-    int rc = check_key(k, err, sizeof err);
+    int rc = check_key(p, k, err, sizeof err);
     if (rc == 1) {
-        if (tb_set_key(k)) {
+        if (cred_set(p, k)) {
             memset(key, 0, sizeof key);
             json_err(r->fd, 500, "could not save the key on the console");
             return;
         }
-        plat_log("login: key accepted and stored");
+        plat_log("login: %s key accepted and stored", providers[p].title);
+        memset(key, 0, sizeof key);
         route_status(r);
-    } else {
-        plat_log("login: key not accepted (%s)", err);
-        json_err(r->fd, rc == 0 ? 401 : 502, err[0] ? err : "could not reach TorBox");
+        return;
     }
+    plat_log("login: %s key not accepted (%s)", providers[p].title, err);
+    json_err(r->fd, rc == 0 ? 401 : 502, err);
     memset(key, 0, sizeof key);
 }
 
 static void route_logout(http_req *r) {
-    tb_clear_key();
+    int p = req_provider(r);
+    if (p < 0) {
+        json_err(r->fd, 400, "unknown provider");
+        return;
+    }
+    cred_clear(p);
     pthread_mutex_lock(&g_user_lock);
-    g_user_json[0] = 0;
+    g_user_json[p][0] = 0;
     pthread_mutex_unlock(&g_user_lock);
-    plat_log("logout: key removed");
+    plat_log("logout: %s key removed", providers[p].title);
     json_ok(r->fd);
 }
 
@@ -141,7 +149,7 @@ static void route_list(http_req *r) {
         json_err(r->fd, 400, "kind must be torrents, webdl or usenet");
         return;
     }
-    if (tb_get_key(key, sizeof key)) {
+    if (cred_get(PROV_TORBOX, key, sizeof key)) {
         json_err(r->fd, 401, "not logged in");
         return;
     }
@@ -153,6 +161,36 @@ static void route_list(http_req *r) {
     memset(key, 0, sizeof key);
     if (!status) json_err(r->fd, 502, err);
     else http_send(r->fd, status, "application/json; charset=utf-8", b.data ? b.data : "{}", b.data ? b.len : 2, NULL);
+    sb_free(&b);
+}
+
+// Real-Debrid: /api/rd/torrents?page=&limit=, /api/rd/downloads?page=&limit=, /api/rd/info?id=
+static void route_rd(http_req *r, const char *what) {
+    char page[16], limit[16], id[64], err[300] = "", tok[256];
+    int logged = cred_get(PROV_RD, tok, sizeof tok) == 0;
+    memset(tok, 0, sizeof tok);
+    if (!logged) {
+        json_err(r->fd, 401, "not logged in");
+        return;
+    }
+    sbuf b;
+    sb_init(&b);
+    int status;
+    if (!strcmp(what, "info")) {
+        form_get(r->query, "id", id, sizeof id);
+        status = rd_info(id, &b, err, sizeof err);
+    } else if (!strcmp(what, "torrents") || !strcmp(what, "downloads")) {
+        form_get(r->query, "page", page, sizeof page);
+        form_get(r->query, "limit", limit, sizeof limit);
+        int lim = atoi(limit);
+        status = rd_list(what, atoi(page), lim > 0 && lim <= 1000 ? lim : 100, &b, err, sizeof err);
+    } else {
+        sb_free(&b);
+        json_err(r->fd, 404, "unknown API call");
+        return;
+    }
+    if ((status == 200 || status == 204) && b.data) http_send_json(r->fd, 200, &b);
+    else json_err(r->fd, status == 401 ? 401 : status >= 400 && status < 500 ? status : 502, err[0] ? err : "no answer");
     sb_free(&b);
 }
 
@@ -420,6 +458,7 @@ void api_handle(http_req *r) {
     }
     if (get && !strcmp(p, "status")) route_status(r);
     else if (get && !strcmp(p, "list")) route_list(r);
+    else if (get && !strncmp(p, "rd/", 3)) route_rd(r, p + 3);
     else if (get && !strcmp(p, "dirs")) route_dirs(r);
     else if (get && !strcmp(p, "jobs")) route_jobs(r);
     else if (get && !strcmp(p, "sha256")) route_sha256(r);

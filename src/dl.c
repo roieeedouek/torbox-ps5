@@ -30,7 +30,9 @@ typedef struct job {
     volatile int stop; // 1 = pause, 2 = cancel (delete the partial file)
     char kind[12];
     long long item_id, file_id;
-    char *url; // kind "url" only
+    char *url;    // kind "url": the link; kind "rd": the hoster link Real-Debrid unrestricts
+    char *direct; // kind "rd": the last unrestricted (direct) link, kept in memory only: it expires
+    int max_conns; // the server's limit on connections per file (Real-Debrid's "chunks"), 0 = none
     char folder[1024], subdir[512], name[256], path[1800];
     int64_t total, done, start_done, started_ms, finished_ms;
     double speed;
@@ -98,7 +100,7 @@ static job *new_job_locked(void) {
         for (i = 0; i < g_njobs; i++)
             if (g_jobs[i]->state >= J_DONE && g_jobs[i]->state != J_PAUSED) break;
         if (i == g_njobs) return NULL;
-        free(g_jobs[i]->url), free(g_jobs[i]);
+        free(g_jobs[i]->url), free(g_jobs[i]->direct), free(g_jobs[i]);
         memmove(g_jobs + i, g_jobs + i + 1, (g_njobs - i - 1) * sizeof *g_jobs);
         g_njobs--;
     }
@@ -264,7 +266,7 @@ static int fetch(conn *c) {
             break;
         }
         curl_easy_reset(h);
-        tb_apply_tls(h);
+        net_apply(h);
         curl_easy_setopt(h, CURLOPT_URL, x->url);
         curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(h, CURLOPT_MAXREDIRS, 10L);
@@ -426,7 +428,7 @@ static int probe(const char *url, int64_t *total, int *ranges, char *final_url, 
     CURL *h = curl_easy_init();
     if (!h) return -1;
     probe_info pi = {0, -1, -1};
-    tb_apply_tls(h);
+    net_apply(h);
     curl_easy_setopt(h, CURLOPT_URL, url);
     curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(h, CURLOPT_MAXREDIRS, 10L);
@@ -540,6 +542,7 @@ static int transfer(job *j, const char *url, char *err, size_t errlen) {
     pthread_mutex_init(&x->lock, NULL);
     pthread_cond_init(&x->cv, NULL);
     int conns = g_connections;
+    if (j->max_conns > 0 && conns > j->max_conns) conns = j->max_conns;
     struct stat st;
     int64_t have = stat(part, &st) ? 0 : st.st_size;
     // A segment table from an earlier run is always continued (whatever the connection count is now): a single
@@ -690,9 +693,51 @@ static void set_state(job *j, int st, const char *err) {
     pthread_mutex_unlock(&g_lock);
 }
 
+// Real-Debrid: the direct link for a hoster link. Uses the last one while it works; a new one is asked for after any
+// failure (direct links expire, also across restarts). Also names the job from Real-Debrid when it has no name yet.
+static int rd_resolve(job *j, char *url, size_t urllen, char *err, size_t errlen, int *permanent) {
+    *permanent = 0;
+    if (j->direct) {
+        snprintf(url, urllen, "%s", j->direct);
+        return 0;
+    }
+    char name[256] = "";
+    int chunks = 0;
+    if (rd_unrestrict(j->url ? j->url : "", url, urllen, name, sizeof name, &chunks, permanent, err, errlen))
+        return -1;
+    pthread_mutex_lock(&g_lock);
+    free(j->direct);
+    j->direct = strdup(url);
+    j->max_conns = chunks > 0 ? chunks : 0;
+    if (!j->name[0]) {
+        sanitize_name(name);
+        snprintf(j->name, sizeof j->name, "%s", name[0] ? name : "download");
+        build_path(j);
+        save_queue_locked();
+    }
+    pthread_mutex_unlock(&g_lock);
+    return 0;
+}
+
+static void forget_direct(job *j) {
+    pthread_mutex_lock(&g_lock);
+    free(j->direct);
+    j->direct = NULL;
+    pthread_mutex_unlock(&g_lock);
+}
+
 static void run_job(job *j) {
     char err[300] = "", url[4096];
     char dir[1800];
+    int is_rd = !strcmp(j->kind, "rd"), permanent = 0;
+    for (int i = 0; is_rd && !j->name[0] && i < 3; i++) { // the file name comes from Real-Debrid
+        if (i) plat_sleep_ms(3000);
+        if (!rd_resolve(j, url, sizeof url, err, sizeof err, &permanent)) break;
+        if (permanent || i == 2 || j->stop || g_quit) {
+            set_state(j, j->stop == 1 ? J_PAUSED : j->stop == 2 ? J_CANCELLED : g_quit ? J_QUEUED : J_FAILED, err);
+            return;
+        }
+    }
     snprintf(dir, sizeof dir, "%s", j->path);
     char *slash = strrchr(dir, '/');
     if (slash) *slash = 0;
@@ -716,7 +761,15 @@ static void run_job(job *j) {
         if (attempt) plat_sleep_ms(attempt < 3 ? 3000 : 10000);
         if (j->stop || g_quit) break;
         if (!strcmp(j->kind, "url")) snprintf(url, sizeof url, "%s", j->url ? j->url : "");
-        else if (tb_request_link(j->kind, j->item_id, j->file_id, url, sizeof url, err, sizeof err)) {
+        else if (is_rd) {
+            if (rd_resolve(j, url, sizeof url, err, sizeof err, &permanent)) {
+                pthread_mutex_lock(&g_lock);
+                snprintf(j->err, sizeof j->err, "%s", err);
+                pthread_mutex_unlock(&g_lock);
+                if (permanent) break;
+                continue;
+            }
+        } else if (tb_request_link(j->kind, j->item_id, j->file_id, url, sizeof url, err, sizeof err)) {
             pthread_mutex_lock(&g_lock);
             snprintf(j->err, sizeof j->err, "link request: %s", err);
             pthread_mutex_unlock(&g_lock);
@@ -744,6 +797,7 @@ static void run_job(job *j) {
         pthread_mutex_lock(&g_lock);
         snprintf(j->err, sizeof j->err, "%s", err);
         pthread_mutex_unlock(&g_lock);
+        if (is_rd && r != T_STOPPED) forget_direct(j); // maybe expired: unrestrict again next time
         if (r == T_STOPPED || r == T_FATAL) break;
         plat_log("job %d: attempt %d failed: %s", j->id, attempt + 1, err);
     }
@@ -802,7 +856,7 @@ void dl_init(int workers) {
 
 int dl_add(const char *kind, long long item_id, long long file_id, const char *url, const char *folder,
            const char *subdir, const char *name, char *err, size_t errlen) {
-    int is_url = !strcmp(kind, "url");
+    int is_rd = !strcmp(kind, "rd"), is_url = !strcmp(kind, "url") || is_rd;
     if (!is_url && strcmp(kind, "torrents") && strcmp(kind, "webdl") && strcmp(kind, "usenet")) {
         snprintf(err, errlen, "unknown kind");
         return -1;
@@ -816,8 +870,8 @@ int dl_add(const char *kind, long long item_id, long long file_id, const char *u
         return -1;
     }
     char clean_name[256], clean_sub[512];
-    snprintf(clean_name, sizeof clean_name, "%s", name && *name ? name : "download");
-    if (is_url && (!name || !*name)) { // name from the URL path
+    snprintf(clean_name, sizeof clean_name, "%s", name && *name ? name : is_rd ? "" : "download");
+    if (is_url && !is_rd && (!name || !*name)) { // name from the URL path
         const char *q = strchr(url + 8, '/');
         const char *end = q ? q + strcspn(q, "?#") : NULL;
         const char *s = end ? end : NULL;
@@ -830,7 +884,7 @@ int dl_add(const char *kind, long long item_id, long long file_id, const char *u
         }
     }
     sanitize_name(clean_name);
-    if (!clean_name[0]) snprintf(clean_name, sizeof clean_name, "download");
+    if (!clean_name[0] && !is_rd) snprintf(clean_name, sizeof clean_name, "download"); // rd: named when it starts
     if (sanitize_relpath(subdir ? subdir : "", clean_sub, sizeof clean_sub)) {
         snprintf(err, errlen, "subfolder too long");
         return -1;
@@ -845,7 +899,7 @@ int dl_add(const char *kind, long long item_id, long long file_id, const char *u
     build_path(&tmp);
     for (int i = 0; i < g_njobs; i++) { // the same target twice would fight over one .part file
         job *o = g_jobs[i];
-        if ((o->state == J_DONE || o->state == J_CANCELLED) || strcmp(o->path, tmp.path)) continue;
+        if ((o->state == J_DONE || o->state == J_CANCELLED) || !tmp.name[0] || strcmp(o->path, tmp.path)) continue;
         pthread_mutex_unlock(&g_lock);
         snprintf(err, errlen, "already in the queue");
         return -1;
@@ -919,7 +973,7 @@ int dl_retry(int id) {
 }
 
 static void remove_at_locked(int i) {
-    free(g_jobs[i]->url), free(g_jobs[i]);
+    free(g_jobs[i]->url), free(g_jobs[i]->direct), free(g_jobs[i]);
     memmove(g_jobs + i, g_jobs + i + 1, (g_njobs - i - 1) * sizeof *g_jobs);
     g_njobs--;
 }
@@ -983,7 +1037,8 @@ void dl_jobs_json(sbuf *o) {
                   j->id, j->kind, state_names[j->state], (long long)j->total, (long long)j->done, j->speed, j->conns,
                   j->active, j->waiting, j->last_code);
         char shown[800];
-        snprintf(shown, sizeof shown, "%s%s%s", j->subdir, j->subdir[0] ? "/" : "", j->name);
+        snprintf(shown, sizeof shown, "%s%s%s", j->subdir, j->subdir[0] ? "/" : "",
+                 j->name[0] ? j->name : "(name comes from Real-Debrid)");
         sb_json_str(o, shown);
         sb_puts(o, ",\"path\":");
         sb_json_str(o, j->path);

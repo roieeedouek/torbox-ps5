@@ -14,25 +14,25 @@
 </header>
 
 <main>
+  <nav id="providers" class="providers" aria-label="Service">
+    <button type="button" data-provider="torbox">TorBox</button>
+    <button type="button" data-provider="realdebrid">Real-Debrid</button>
+  </nav>
+
   <section id="login" class="card hidden">
-    <h2>Log in</h2>
-    <p>Paste your TorBox API key (torbox.app, Settings, API Key).</p>
+    <h2 id="login-title">Log in</h2>
+    <p id="login-help"></p>
     <form id="login-form" autocomplete="off">
       <input id="key" type="password" placeholder="API key" autocomplete="off" spellcheck="false" required>
       <button class="primary" type="submit">Log in</button>
     </form>
-    <p class="muted small">The key is checked with TorBox, then stored <b>unencrypted</b> on the console in
+    <p class="muted small">The key is checked with the service, then stored <b>unencrypted</b> on the console in
       <code id="key-file">the app folder</code>. Log out to delete it. It is never shown again here.</p>
     <p id="login-error" class="error"></p>
   </section>
 
   <section id="app" class="hidden">
-    <nav class="tabs">
-      <button data-tab="torrents" class="active">Torrents</button>
-      <button data-tab="webdl">Web</button>
-      <button data-tab="usenet">Usenet</button>
-      <button data-tab="downloads">Downloads <span id="badge" class="badge hidden">0</span></button>
-    </nav>
+    <nav id="tabs" class="tabs"></nav>
 
     <div class="folderbar card">
       <label for="folder">Save to</label>
@@ -49,6 +49,7 @@
       </div>
       <p id="list-status" class="muted"></p>
       <div id="items"></div>
+      <button id="more" type="button" class="hidden">Load more</button>
     </div>
 
     <div id="downloads-view" class="hidden">
@@ -65,9 +66,13 @@
           </label>
           <button id="clear" type="button">Clear finished</button>
         </div>
-        <form id="url-form" class="row" autocomplete="off">
-          <input id="url" type="url" placeholder="Or download a direct link (https://...)" spellcheck="false">
-          <button type="submit">Add</button>
+        <form id="url-form" autocomplete="off">
+          <div class="row">
+            <input id="url" type="url" placeholder="Or download a link (https://...)" spellcheck="false">
+            <button type="submit">Add</button>
+          </div>
+          <label id="url-rd-wrap" class="check hidden"><input id="url-rd" type="checkbox" checked>
+            Unrestrict with Real-Debrid (hoster links)</label>
         </form>
       </div>
       <div id="jobs"></div>
