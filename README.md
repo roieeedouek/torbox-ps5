@@ -45,6 +45,8 @@ You need FTP access to the console (e.g. zftpd on port 2120 or 2121) and ShadowM
    for f in eboot.bin torbox-ps5.elf sce_sys/param.json sce_sys/icon0.png sce_module/libc.prx; do
        curl --disable-epsv --ftp-create-dirs -T "$D/$f" "$H/data/homebrew/PPSA97630/$f"
    done
+   curl --disable-epsv -Q "SITE CHMOD 755 /data/homebrew/PPSA97630/eboot.bin" \
+        -Q "SITE CHMOD 755 /data/homebrew/PPSA97630/sce_module/libc.prx" "$H/data/homebrew/PPSA97630/"
    ```
    It must end up as:
    ```
@@ -54,7 +56,7 @@ You need FTP access to the console (e.g. zftpd on port 2120 or 2121) and ShadowM
    /data/homebrew/PPSA97630/sce_sys/icon0.png
    /data/homebrew/PPSA97630/sce_module/libc.prx  (chmod 755)
    ```
-   Set the two modes from your FTP client (`SITE CHMOD 755 ...`) or the shell server (`chmod 755 <file>`).
+   The last command sets the two modes (or use your FTP client's chmod, or the shell server's `chmod 755 <file>`).
 2. Register the title with ShadowMountPlus. "TorBox Downloader" appears on the home screen.
 3. Open the tile. The server starts (a notification shows `TorBox: open http://<console-ip>:8080 in a browser`)
    and the PS5's browser opens on the page. You can also use the page from a phone or PC at that address.
