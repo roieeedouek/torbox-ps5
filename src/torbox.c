@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -65,6 +66,23 @@ void tb_clear_key(void) {
     pthread_mutex_unlock(&g_key_lock);
 }
 
+// The console gives sockets a 64 KiB receive buffer, which caps one connection at window / RTT (about 1.2 MB/s at
+// 60 ms). 512 KiB, the most it grants, measured 7.9 MB/s on one connection. Set before connect() so the TCP
+// handshake announces the bigger window.
+static int big_rcvbuf(void *ud, curl_socket_t fd, curlsocktype purpose) {
+    (void)ud;
+    if (purpose != CURLSOCKTYPE_IPCXN) return CURL_SOCKOPT_OK;
+    int sizes[] = {4 << 20, 1 << 20, 512 << 10, 256 << 10};
+    for (unsigned i = 0; i < sizeof sizes / sizeof *sizes; i++) {
+        int got = 0;
+        socklen_t l = sizeof got;
+        if (!setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sizes[i], sizeof sizes[i]) &&
+            !getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &got, &l) && got >= (256 << 10))
+            break;
+    }
+    return CURL_SOCKOPT_OK;
+}
+
 void tb_apply_tls(void *h) {
     CURL *c = h;
     struct curl_blob blob = {(void *)cacert_pem, cacert_pem_len, CURL_BLOB_NOCOPY};
@@ -72,6 +90,7 @@ void tb_apply_tls(void *h) {
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(c, CURLOPT_USERAGENT, "torbox-ps5/" APP_VERSION);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 20L);
+    curl_easy_setopt(c, CURLOPT_SOCKOPTFUNCTION, big_rcvbuf);
 #ifdef __PROSPERO__
     curl_easy_setopt(c, CURLOPT_IPRESOLVE, (long)CURL_IPRESOLVE_V4);
 #endif

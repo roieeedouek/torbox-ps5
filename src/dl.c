@@ -21,7 +21,7 @@ static const char *state_names[] = {"queued", "starting", "downloading", "done",
 #define MAX_JOBS 1000
 #define MAX_SEGS 16
 #define SEG_MIN (16ll * 1024 * 1024) // no segment smaller than this
-#define WBUF (1024 * 1024)            // write buffer per connection (few, big writes)
+#define WBUF (4 * 1024 * 1024)        // write buffer per connection: 4 MiB writes measured 179 MB/s on /data, 1 MiB 130
 
 typedef struct job {
     int id, state;
@@ -153,7 +153,8 @@ static void load_queue(void) {
 
 typedef struct seg {
     int64_t start, end; // inclusive range
-    volatile int64_t pos; // next byte to write
+    volatile int64_t pos;  // next byte to write (on disk)
+    volatile int64_t seen; // received, including what still sits in the write buffer (progress display)
 } seg;
 
 typedef struct xfer {
@@ -230,6 +231,7 @@ static size_t on_data(char *p, size_t sz, size_t n, void *ud) {
         c->used += take, at += take;
         if (c->used == WBUF && flush_conn(c)) return 0;
     }
+    __atomic_store_n(&c->x->segs[c->index >= 0 ? c->index : 0].seen, c->off + (int64_t)c->used, __ATOMIC_RELAXED);
     return sz * n;
 }
 
@@ -424,10 +426,14 @@ static void save_state(xfer *x, int64_t total) {
     rename(tmp, path);
 }
 
-static int64_t xfer_done(xfer *x, int single) {
-    if (single) return __atomic_load_n(&x->segs[0].pos, __ATOMIC_RELAXED);
+// Bytes done: on disk (seen = 0) or received (seen = 1, for the progress display).
+static int64_t xfer_done(xfer *x, int single, int seen) {
     int64_t d = 0;
-    for (int i = 0; i < x->nseg; i++) d += __atomic_load_n(&x->segs[i].pos, __ATOMIC_RELAXED) - x->segs[i].start;
+    for (int i = 0; i < (single ? 1 : x->nseg); i++) {
+        int64_t p = __atomic_load_n(&x->segs[i].pos, __ATOMIC_RELAXED);
+        int64_t r = __atomic_load_n(&x->segs[i].seen, __ATOMIC_RELAXED);
+        d += (seen && r > p ? r : p) - (single ? 0 : x->segs[i].start);
+    }
     return d;
 }
 
@@ -486,7 +492,7 @@ static int transfer(job *j, const char *url, char *err, size_t errlen) {
     if (!single) save_state(x, total);
     pthread_mutex_lock(&g_lock);
     j->total = total;
-    j->done = xfer_done(x, single);
+    j->done = xfer_done(x, single, 0);
     j->start_done = j->done;
     j->state = J_RUNNING;
     pthread_mutex_unlock(&g_lock);
@@ -525,7 +531,7 @@ static int transfer(job *j, const char *url, char *err, size_t errlen) {
     while (x->live > 0) {
         pthread_mutex_unlock(&x->lock);
         plat_sleep_ms(500);
-        int64_t now = plat_now_ms(), d = xfer_done(x, single);
+        int64_t now = plat_now_ms(), d = xfer_done(x, single, 1);
         if (now - last_ms >= 1000) {
             double inst = (double)(d - last_done) * 1000.0 / (double)(now - last_ms);
             speed = speed == 0 ? inst : speed * 0.6 + inst * 0.4;
@@ -539,7 +545,7 @@ static int transfer(job *j, const char *url, char *err, size_t errlen) {
     }
     pthread_mutex_unlock(&x->lock);
 
-    int64_t d = xfer_done(x, single);
+    int64_t d = xfer_done(x, single, 0);
     int complete = !x->failed && !j->stop && !g_quit && !x->disk_error && (total < 0 || d >= total);
     if (fsync(x->fd)) { /* best effort */ }
     close(x->fd);
