@@ -19,7 +19,7 @@ enum { J_QUEUED, J_STARTING, J_RUNNING, J_DONE, J_FAILED, J_PAUSED, J_CANCELLED 
 static const char *state_names[] = {"queued", "starting", "downloading", "done", "failed", "paused", "cancelled"};
 
 #define MAX_JOBS 1000
-#define MAX_CONNS 32                   // connections per file
+#define MAX_CONNS 16                   // connections per file (TorBox's CDN stalled most of 32 without an error)
 #define MAX_SEGS 256                   // segment table entries (they grow when idle connections split segments)
 #define MULTI_MIN (8ll * 1024 * 1024)  // smaller files use one connection
 #define SPLIT_MIN (8ll * 1024 * 1024)  // only segments with at least this much left are split
@@ -41,7 +41,7 @@ typedef struct job {
 
 static job *g_jobs[MAX_JOBS];
 static int g_njobs, g_next_id = 1, g_running;
-static int g_parallel = 1, g_connections = 16;
+static int g_parallel = 1, g_connections = 8;
 static volatile int g_quit;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;

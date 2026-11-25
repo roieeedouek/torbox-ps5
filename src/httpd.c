@@ -35,7 +35,10 @@ static int wait_fd(int fd, short ev, int ms) {
     return r;
 }
 
-static int send_all(int fd, const void *data, size_t len) {
+int http_send_raw(int fd, const void *data, size_t len);
+static int send_all(int fd, const void *data, size_t len) { return http_send_raw(fd, data, len); }
+
+int http_send_raw(int fd, const void *data, size_t len) {
     const char *p = data;
     while (len) {
         if (wait_fd(fd, POLLOUT, 30000) <= 0) return -1;

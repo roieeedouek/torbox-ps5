@@ -380,6 +380,22 @@ static void route_sha256(http_req *r) {
     sb_free(&b);
 }
 
+// LAN speed test: streams N MiB of zeros, so a browser on the network can see what the console's link carries.
+static void route_speedtest(http_req *r) {
+    char mb[16];
+    form_get(r->query, "mb", mb, sizeof mb);
+    long n = atol(mb);
+    if (n <= 0 || n > 4096) n = 200;
+    static const char zeros[256 * 1024];
+    char head[256];
+    int len = snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                                          "Content-Length: %ld\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                       n << 20);
+    if (http_send_raw(r->fd, head, len)) return;
+    for (long i = 0; i < n * 4; i++)
+        if (http_send_raw(r->fd, zeros, sizeof zeros)) return;
+}
+
 static void route_static(http_req *r) {
     const char *name = r->path[1] ? r->path + 1 : "index.html";
     const asset *a = asset_find(name);
@@ -407,6 +423,7 @@ void api_handle(http_req *r) {
     else if (get && !strcmp(p, "dirs")) route_dirs(r);
     else if (get && !strcmp(p, "jobs")) route_jobs(r);
     else if (get && !strcmp(p, "sha256")) route_sha256(r);
+    else if (get && !strcmp(p, "speedtest")) route_speedtest(r);
     else if (post && !strcmp(p, "login")) route_login(r);
     else if (post && !strcmp(p, "logout")) route_logout(r);
     else if (post && !strcmp(p, "mkdir")) route_mkdir(r);
