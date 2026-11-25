@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TorBox for PS5</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><img src="favicon.svg" alt="" width="26" height="26"><span>TorBox <small>for PS5</small></span></div>
+  <div id="conn" class="pill">connecting...</div>
+</header>
+
+<main>
+  <section id="login" class="card hidden">
+    <h2>Log in</h2>
+    <p>Paste your TorBox API key (torbox.app, Settings, API Key).</p>
+    <form id="login-form" autocomplete="off">
+      <input id="key" type="password" placeholder="API key" autocomplete="off" spellcheck="false" required>
+      <button class="primary" type="submit">Log in</button>
+    </form>
+    <p class="muted small">The key is checked with TorBox, then stored <b>unencrypted</b> on the console in
+      <code id="key-file">the app folder</code>. Log out to delete it. It is never shown again here.</p>
+    <p id="login-error" class="error"></p>
+  </section>
+
+  <section id="app" class="hidden">
+    <nav class="tabs">
+      <button data-tab="torrents" class="active">Torrents</button>
+      <button data-tab="webdl">Web</button>
+      <button data-tab="usenet">Usenet</button>
+      <button data-tab="downloads">Downloads <span id="badge" class="badge hidden">0</span></button>
+    </nav>
+
+    <div class="folderbar card">
+      <label for="folder">Save to</label>
+      <div class="row">
+        <input id="folder" type="text" spellcheck="false" autocomplete="off">
+        <button id="browse" type="button">Browse</button>
+      </div>
+    </div>
+
+    <div id="list-view">
+      <div class="toolbar">
+        <input id="filter" type="search" placeholder="Filter by name">
+        <button id="refresh" type="button" title="Reload from TorBox">Refresh</button>
+      </div>
+      <p id="list-status" class="muted"></p>
+      <div id="items"></div>
+    </div>
+
+    <div id="downloads-view" class="hidden">
+      <div class="card">
+        <div class="settings">
+          <label>Connections per file
+            <select id="connections">
+              <option>1</option><option>2</option><option>4</option><option>6</option><option>8</option>
+              <option>12</option><option>16</option>
+            </select>
+          </label>
+          <label>Files at a time
+            <select id="parallel"><option>1</option><option>2</option><option>3</option></select>
+          </label>
+          <button id="clear" type="button">Clear finished</button>
+        </div>
+        <form id="url-form" class="row" autocomplete="off">
+          <input id="url" type="url" placeholder="Or download a direct link (https://...)" spellcheck="false">
+          <button type="submit">Add</button>
+        </form>
+      </div>
+      <div id="jobs"></div>
+      <p id="jobs-empty" class="muted">No downloads yet. Pick a file in Torrents, Web or Usenet.</p>
+    </div>
+
+    <footer class="foot">
+      <span id="account" class="muted small"></span>
+      <span class="grow"></span>
+      <button id="logout" type="button" class="link">Log out</button>
+      <button id="quit" type="button" class="link danger">Stop server</button>
+    </footer>
+  </section>
+</main>
+
+<div id="picker" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="picker-title">
+  <div class="modal-box">
+    <div class="modal-head"><h3 id="picker-title">Choose a folder</h3><button id="picker-close" class="link" type="button">Close</button></div>
+    <div id="picker-roots" class="chips"></div>
+    <div class="row"><button id="picker-up" type="button">Up</button><code id="picker-path" class="grow"></code></div>
+    <p id="picker-free" class="muted small"></p>
+    <ul id="picker-dirs" class="dirs"></ul>
+    <p id="picker-error" class="error"></p>
+    <div class="row">
+      <button id="picker-new" type="button">New folder</button>
+      <span class="grow"></span>
+      <button id="picker-use" class="primary" type="button">Use this folder</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="app.js"></script>
+</body>
+</html>
