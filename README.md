@@ -21,7 +21,7 @@ There are two pieces:
 | Piece | What it is | Why |
 |---|---|---|
 | `torbox-ps5.elf` | The web server and downloader, a payload for the ELF loader (elfldr, port 9021). | Runs in the background, independent of any app: downloads continue while you play. |
-| `PPSA97630` title | A home-screen tile, "TorBox Downloader". Opening it sends `torbox-ps5.elf` to elfldr on `127.0.0.1:9021`, then closes itself. If the server is already running it only shows the address. | One tap to start, like your other homebrew. |
+| `PPSA97630` title | A home-screen tile, "TorBox Downloader". Opening it starts the server if it isn't running (sends `torbox-ps5.elf` to elfldr on `127.0.0.1:9021`), opens the PS5's web browser on `http://127.0.0.1:8080` (the same page, on the TV, controlled with the controller), and closes itself. | One tap to start and use, like your other homebrew. |
 
 The server is deliberately **not** inside the title. A PS5 game or app is closed when another game starts and
 stops in rest mode. A server living in the title would cut downloads off as soon as you started a game. The
@@ -56,7 +56,8 @@ You need FTP access to the console (e.g. zftpd on port 2120 or 2121) and ShadowM
    ```
    Set the two modes from your FTP client (`SITE CHMOD 755 ...`) or the shell server (`chmod 755 <file>`).
 2. Register the title with ShadowMountPlus. "TorBox Downloader" appears on the home screen.
-3. Open the tile. A notification shows `TorBox: open http://<console-ip>:8080 in a browser`.
+3. Open the tile. The server starts (a notification shows `TorBox: open http://<console-ip>:8080 in a browser`)
+   and the PS5's browser opens on the page. You can also use the page from a phone or PC at that address.
 
 **Without the title:** send the payload yourself: `cat torbox-ps5.elf > /dev/tcp/<console-ip>/9021` (Linux/WSL),
 or with any payload sender to port 9021.
