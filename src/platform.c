@@ -168,4 +168,20 @@ int64_t plat_now_ms(void) {
     return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
+int64_t plat_now_us(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000000 + tv.tv_usec;
+}
+
 void plat_sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+
+int plat_is_usb_path(const char *path) {
+    if (!path) return 0;
+    if (!strncmp(path, "/mnt/usb", 8) && path[8] >= '0' && path[8] <= '9') return 1;
+#ifndef __PROSPERO__
+    const char *forced = getenv("TORBOX_FORCE_USB_MODE");
+    if (forced && !strcmp(forced, "1")) return 1;
+#endif
+    return 0;
+}

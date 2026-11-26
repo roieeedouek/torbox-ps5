@@ -57,8 +57,8 @@
         <div class="settings">
           <label>Connections per file
             <select id="connections">
-              <option>1</option><option>2</option><option>4</option><option>6</option><option>8</option>
-              <option>12</option><option>16</option>
+              <option value="0">Auto</option><option>1</option><option>2</option><option>4</option><option>6</option>
+              <option>8</option><option>12</option><option>16</option>
             </select>
           </label>
           <label>Files at a time
@@ -82,6 +82,7 @@
     <footer class="foot">
       <span id="account" class="muted small"></span>
       <span class="grow"></span>
+      <button id="logs-btn" type="button" class="link">Logs</button>
       <button id="logout" type="button" class="link">Log out</button>
       <button id="quit" type="button" class="link danger">Stop server</button>
     </footer>
@@ -101,6 +102,19 @@
       <span class="grow"></span>
       <button id="picker-use" class="primary" type="button">Use this folder</button>
     </div>
+  </div>
+</div>
+
+<div id="logs-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="logs-title">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3 id="logs-title">Diagnostics log</h3>
+      <div class="row">
+        <button id="logs-refresh" type="button" class="small">Refresh</button>
+        <button id="logs-close" class="link" type="button">Close</button>
+      </div>
+    </div>
+    <pre id="logs-body" class="logview">Loading...</pre>
   </div>
 </div>
 

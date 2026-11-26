@@ -1,8 +1,10 @@
-// Download queue: a few jobs at a time, each split over several HTTP Range connections when the server allows it.
+// Download queue: curl_multi transfer engine with decoupled async disk writes, schedulable 16 MiB ranges,
+// tail splitting, per-host AIMD congestion control, USB/exFAT sequential sliding-window mode, and TorBox
+// CDN rotation.
 //
-// A job writes <folder>/<name>.part; a multi-connection job also keeps <name>.part.state (the segment table), so a
-// paused, failed or interrupted job (even across restarts) resumes where it stopped. Finished: renamed to <name>.
-// TorBox links are requested when the job starts (and again after an error), never stored.
+// A job writes <folder>/<name>.part; a multi-connection job also keeps <name>.part.state (the segment table),
+// so a paused, failed or interrupted job (even across restarts) resumes where it stopped. Finished: renamed
+// to <name>. TorBox/Real-Debrid links are requested when the job starts (and again after an error), never stored.
 #include "app.h"
 
 #include <curl/curl.h>
@@ -12,18 +14,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 enum { J_QUEUED, J_STARTING, J_RUNNING, J_DONE, J_FAILED, J_PAUSED, J_CANCELLED };
 static const char *state_names[] = {"queued", "starting", "downloading", "done", "failed", "paused", "cancelled"};
 
 #define MAX_JOBS 1000
-#define MAX_CONNS 16                   // connections per file (TorBox's CDN stalled most of 32 without an error)
-#define MAX_SEGS 256                   // segment table entries (they grow when idle connections split segments)
-#define MULTI_MIN (8ll * 1024 * 1024)  // smaller files use one connection
-#define SPLIT_MIN (8ll * 1024 * 1024)  // only segments with at least this much left are split
-#define WBUF (2 * 1024 * 1024)         // write buffer per connection (1 MiB writes measured 130 MB/s on /data, 4 MiB 179)
+#define MAX_CONNS 16                     // max connections per file
+#define DEBRID_AUTO_CONNS 8              // Auto mode ceiling for TorBox / Real-Debrid CDNs
+#define MAX_SEGS 256                     // segment table entries (grow when idle connections split tails)
+#define MULTI_MIN (8ll * 1024 * 1024)    // smaller files use one connection
+#define CHUNK_CAP (16ll * 1024 * 1024)   // max bytes requested per HTTP range call (warm keep-alive reuse)
+#define SPLIT_MIN (2ll * 1024 * 1024)    // min remaining bytes in a segment before an idle slot splits it
+#define USB_CHUNK (1024 * 1024)          // 1 MiB sliding-window chunk on /mnt/usb* (exFAT)
+#define USB_WIN_SLOTS 8                  // at most 8 MiB of in-flight USB window buffers
 
 typedef struct job {
     int id, state;
@@ -35,18 +42,31 @@ typedef struct job {
     int max_conns; // the server's limit on connections per file (Real-Debrid's "chunks"), 0 = none
     char folder[1024], subdir[512], name[256], path[1800];
     int64_t total, done, start_done, started_ms, finished_ms;
-    double speed;
-    int conns, active, waiting; // started connections; of those, receiving now; waiting out a server limit
-    long last_code;             // last HTTP status a connection got
+    double speed, disk_speed;
+    size_t buffered;
+    unsigned write_max_ms;
+    int conns, active, waiting, paused_conns, win, rcvbuf, usb_mode;
+    long last_code;
+    char http_ver[8], cdn[128];
     char err[300], note[160];
 } job;
 
 static job *g_jobs[MAX_JOBS];
 static int g_njobs, g_next_id = 1, g_running;
-static int g_parallel = 1, g_connections = 8;
+static int g_parallel = 1, g_connections = 0; // 0 = Auto (8 on TorBox/RD, 16 on direct URLs)
 static volatile int g_quit;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
+
+static int test_env_int(const char *name, int def) {
+#ifdef __PROSPERO__
+    (void)name;
+    return def;
+#else
+    const char *v = getenv(name);
+    return v && *v && atoi(v) > 0 ? atoi(v) : def;
+#endif
+}
 
 // ---------- persistence: queue.tsv (unfinished jobs) and settings.txt ----------
 
@@ -89,13 +109,13 @@ static void load_settings(void) {
     while (fgets(line, sizeof line, f)) {
         int v;
         if (sscanf(line, "parallel=%d", &v) == 1 && v >= 1 && v <= 3) g_parallel = v;
-        if (sscanf(line, "connections=%d", &v) == 1 && v >= 1 && v <= MAX_CONNS) g_connections = v;
+        if (sscanf(line, "connections=%d", &v) == 1 && v >= 0 && v <= MAX_CONNS) g_connections = v;
     }
     fclose(f);
 }
 
 static job *new_job_locked(void) {
-    if (g_njobs == MAX_JOBS) { // drop the oldest finished job
+    if (g_njobs == MAX_JOBS) {
         int i;
         for (i = 0; i < g_njobs; i++)
             if (g_jobs[i]->state >= J_DONE && g_jobs[i]->state != J_PAUSED) break;
@@ -154,308 +174,90 @@ static void load_queue(void) {
     fclose(f);
 }
 
-// ---------- transfers ----------
+// ---------- transfers (curl_multi + async writer) ----------
 
 typedef struct seg {
-    int64_t start, end; // inclusive range
-    volatile int64_t pos;  // next byte to write (on disk)
-    volatile int64_t seen; // received, including what still sits in the write buffer (progress display)
-    volatile int64_t last_data_ms;
-    volatile int waiting;  // in a 429/503 back-off
-    int owned;             // a connection works on it (x->lock)
+    int64_t start, end;    // inclusive range
+    volatile int64_t pos;  // next byte to commit on disk (written by writer thread)
+    int64_t seen;          // received from network (network thread only)
+    int64_t retry_at_ms;   // earliest time this segment can be retried
+    int64_t last_data_ms;
+    int attempts;          // transport error attempts for this segment
+    int busy_retries;      // 429/503 retries for this segment
+    int owned;
+    int waiting;           // currently waiting out a 429/503/retry backoff
 } seg;
 
-typedef struct xfer {
+typedef struct xfer xfer;
+
+typedef struct slot {
+    xfer *x;
+    CURL *h;
+    int seg_idx;
+    int active;
+    int paused;    // paused via CURL_WRITEFUNC_PAUSE waiting for a free writer block
+    int cut_done;  // tail-stolen past new end: handle ready to be removed from multi
+    int checked;   // response headers verified on first body callback
+
+    int64_t req_start, req_end, cur_off;
+
+    // Standard mode: 128 KiB writer block staged before handing to writer_enqueue()
+    wblock *block;
+    int64_t block_off;
+    size_t block_used;
+
+    // USB sequential mode: 1 MiB chunk buffer drained into writer in ascending offset order
+    char *win_buf;
+    int64_t chunk_start, chunk_end;
+    size_t win_used, win_drained;
+    int usb_assigned, usb_ready;
+    int usb_attempts, usb_busy_retries;
+    int64_t usb_retry_at_ms;
+
+    struct curl_slist *hdrs;
+
+    // Response header state
+    long resp_code;
+    int resp_range_ok, resp_encoding_bad, resp_html;
+    int bad_resp, validator_mismatch;
+    int64_t resp_start, resp_end, resp_total, resp_clen;
+    int resp_retry_after;
+    char resp_etag[256], resp_lastmod[128];
+    char err[256];
+} slot;
+
+struct xfer {
     job *j;
     const char *url;
     int fd;
-    volatile int nseg; // grows (under lock) when a segment is split
+    int single, usb_mode, is_debrid;
+    int64_t total;
+    int nseg;
     seg segs[MAX_SEGS];
-    pthread_mutex_t lock;
-    pthread_cond_t cv;
-    int live;          // running connection threads
-    int failed;        // a connection gave up
-    long http_error;   // last HTTP status >= 400 seen
-    volatile long last_code;
-    int disk_error;    // errno of a failed write
+
+    CURLM *multi;
+    writer *w;
+    pthread_mutex_t state_lock; // protects segs[0..nseg] reads during writer's 5s checkpoint
+    slot slots[MAX_CONNS];
+    int nslots;
+
+    // AIMD congestion window
+    int max_conns, win_allowed, win_congested;
+    int64_t win_grown_ms, win_shrunk_ms, win_paused_until_ms;
+
+    // USB sliding window cursors
+    int64_t usb_cursor, usb_next_issue;
+
+    // Diagnostics & stall watchdog
+    net_sock_info sock_info;
+    int rcvbuf;
+    char etag[256], last_modified[128], http_ver[8], cdn[128];
+    long http_error, last_code;
+    int relink_needed, failed;
     char err[256];
-} xfer;
-
-typedef struct conn {
-    xfer *x;
-    int index; // segment, or -1 for the single stream
-    char *buf;
-    size_t used;
-    int64_t off;    // file offset of buf[0]
-    int checked;    // response code verified
-    CURL *h;
-} conn;
-
-static int flush_conn(conn *c) {
-    size_t at = 0;
-    while (at < c->used) {
-        ssize_t n = pwrite(c->x->fd, c->buf + at, c->used - at, c->off + at);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            c->x->disk_error = errno;
-            return -1;
-        }
-        at += n;
-    }
-    c->off += c->used;
-    if (c->index >= 0) __atomic_store_n(&c->x->segs[c->index].pos, c->off, __ATOMIC_RELAXED);
-    else __atomic_store_n(&c->x->segs[0].pos, c->off, __ATOMIC_RELAXED);
-    c->used = 0;
-    return 0;
-}
-
-static size_t on_data(char *p, size_t sz, size_t n, void *ud) {
-    conn *c = ud;
-    size_t len = sz * n;
-    if (!c->checked) {
-        c->checked = 1;
-        long code = 0;
-        curl_easy_getinfo(c->h, CURLINFO_RESPONSE_CODE, &code);
-        if (c->index >= 0 && code != 206) {
-            snprintf(c->x->err, sizeof c->x->err, "server ignored the byte range (HTTP %ld)", code);
-            return 0;
-        }
-        if (c->index < 0 && c->off > 0 && code == 200) { // resume refused: start over
-            if (ftruncate(c->x->fd, 0)) { /* pwrite from 0 overwrites anyway */ }
-            c->off = 0;
-            __atomic_store_n(&c->x->segs[0].pos, 0, __ATOMIC_RELAXED);
-            c->x->segs[0].start = 0;
-        }
-    }
-    if (c->index >= 0) { // never write past the segment end
-        seg *s = &c->x->segs[c->index];
-        int64_t room = __atomic_load_n(&s->end, __ATOMIC_ACQUIRE) + 1 - (c->off + (int64_t)c->used);
-        if (room <= 0) return 0;
-        if ((int64_t)len > room) len = (size_t)room;
-    }
-    size_t at = 0;
-    while (at < len) {
-        size_t take = WBUF - c->used < len - at ? WBUF - c->used : len - at;
-        memcpy(c->buf + c->used, p + at, take);
-        c->used += take, at += take;
-        if (c->used == WBUF && flush_conn(c)) return 0;
-    }
-    seg *sg = &c->x->segs[c->index >= 0 ? c->index : 0];
-    __atomic_store_n(&sg->seen, c->off + (int64_t)c->used, __ATOMIC_RELAXED);
-    sg->last_data_ms = plat_now_ms();
-    return sz * n;
-}
-
-static int on_progress(void *ud, curl_off_t dt, curl_off_t dn, curl_off_t ut, curl_off_t un) {
-    (void)dt, (void)dn, (void)ut, (void)un;
-    conn *c = ud;
-    return c->x->j->stop || g_quit || c->x->failed;
-}
-
-// Fetches the connection's segment (or the whole file), retrying network errors a few times. 1 = complete.
-static int fetch(conn *c) {
-    xfer *x = c->x;
-    CURL *h = c->h;
-    int ok = 0, busy = 0;
-    for (int attempt = 0; h && attempt < 4; attempt++) {
-        seg *s = &x->segs[c->index >= 0 ? c->index : 0];
-        c->off = __atomic_load_n(&s->pos, __ATOMIC_RELAXED);
-        c->used = 0, c->checked = 0;
-        if (c->index >= 0 && c->off > __atomic_load_n(&s->end, __ATOMIC_ACQUIRE)) { // segment complete
-            ok = 1;
-            break;
-        }
-        curl_easy_reset(h);
-        net_apply(h);
-        curl_easy_setopt(h, CURLOPT_URL, x->url);
-        curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(h, CURLOPT_MAXREDIRS, 10L);
-        curl_easy_setopt(h, CURLOPT_FAILONERROR, 1L);
-        curl_easy_setopt(h, CURLOPT_BUFFERSIZE, 512L * 1024);
-        curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1L);
-        curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, 90L);
-        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, on_data);
-        curl_easy_setopt(h, CURLOPT_WRITEDATA, c);
-        curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, on_progress);
-        curl_easy_setopt(h, CURLOPT_XFERINFODATA, c);
-        curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
-        char range[64];
-        if (c->index >= 0) {
-            snprintf(range, sizeof range, "%lld-%lld", (long long)c->off,
-                     (long long)__atomic_load_n(&s->end, __ATOMIC_ACQUIRE));
-            curl_easy_setopt(h, CURLOPT_RANGE, range);
-        } else if (c->off > 0) curl_easy_setopt(h, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)c->off);
-        int64_t before = c->off;
-        CURLcode rc = curl_easy_perform(h);
-        int flushed = flush_conn(c) == 0;
-        if (flushed && c->index >= 0 &&
-            __atomic_load_n(&s->pos, __ATOMIC_RELAXED) > __atomic_load_n(&s->end, __ATOMIC_ACQUIRE)) {
-            ok = 1;
-            break;
-        }
-        if (rc == CURLE_OK && flushed) {
-            if (c->index < 0) {
-                ok = 1;
-                break;
-            }
-            if (c->off > before) attempt = -1; // the server closed early but sent data: fetch the rest
-            continue;
-        }
-        if (x->j->stop || g_quit || x->failed || !flushed || x->disk_error) break;
-        long code = 0;
-        curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
-        if (code) x->last_code = code;
-        if ((code == 429 || code == 503) && busy < 60) {
-            // The server limits parallel connections: wait for a free slot (others keep going), then retry.
-            int wait = 2 + busy * 2 < 20 ? 2 + busy * 2 : 20;
-            busy++, attempt--;
-            s->waiting = 1;
-            for (int t = 0; t < wait * 4 && !x->j->stop && !g_quit && !x->failed; t++) plat_sleep_ms(250);
-            s->waiting = 0;
-            continue;
-        }
-        if (rc == CURLE_HTTP_RETURNED_ERROR || code >= 400) {
-            pthread_mutex_lock(&x->lock);
-            x->http_error = code;
-            if (!x->err[0]) snprintf(x->err, sizeof x->err, "HTTP %ld", code);
-            pthread_mutex_unlock(&x->lock);
-            break; // the link may have expired: the job asks for a new one
-        }
-        if (rc == CURLE_WRITE_ERROR && x->err[0]) break; // range ignored
-        if (c->off > before) { // the connection broke after some data: go on at once, not counted
-            attempt = -1;
-            continue;
-        }
-        pthread_mutex_lock(&x->lock);
-        snprintf(x->err, sizeof x->err, "%s", curl_easy_strerror(rc));
-        pthread_mutex_unlock(&x->lock);
-        plat_sleep_ms(2000);
-    }
-    return ok;
-}
-
-// Gives a connection work: an unowned unfinished segment, or else the second half of the segment with the most
-// left (its owner stops at the new end). -1 = nothing worth taking. Keeps every connection busy until the end.
-static int claim(xfer *x) {
-    pthread_mutex_lock(&x->lock);
-    int best = -1;
-    int64_t best_left = 0;
-    for (int i = 0; i < x->nseg; i++) {
-        seg *s = &x->segs[i];
-        int64_t end = __atomic_load_n(&s->end, __ATOMIC_ACQUIRE);
-        int64_t at = __atomic_load_n(&s->seen, __ATOMIC_RELAXED);
-        int64_t pos = __atomic_load_n(&s->pos, __ATOMIC_RELAXED);
-        if (at < pos) at = pos;
-        if (!s->owned && pos <= end) {
-            s->owned = 1;
-            pthread_mutex_unlock(&x->lock);
-            return i;
-        }
-        if (s->owned && end - at > best_left) best = i, best_left = end - at;
-    }
-    int got = -1;
-    if (best >= 0 && best_left >= SPLIT_MIN && x->nseg < MAX_SEGS) {
-        seg *s = &x->segs[best];
-        int64_t at = __atomic_load_n(&s->seen, __ATOMIC_RELAXED);
-        int64_t mid = at + best_left / 2;
-        got = x->nseg;
-        seg *n = &x->segs[got];
-        memset(n, 0, sizeof *n);
-        n->start = n->pos = n->seen = mid + 1;
-        n->end = s->end;
-        n->owned = 1;
-        __atomic_store_n(&s->end, mid, __ATOMIC_RELEASE);
-        __atomic_store_n(&x->nseg, got + 1, __ATOMIC_RELEASE);
-    }
-    pthread_mutex_unlock(&x->lock);
-    return got;
-}
-
-static void *conn_thread(void *arg) {
-    conn *c = arg;
-    xfer *x = c->x;
-    c->h = curl_easy_init();
-    int ok = c->h != NULL;
-    while (ok) {
-        ok = fetch(c);
-        if (c->index < 0) break; // single stream
-        pthread_mutex_lock(&x->lock);
-        x->segs[c->index].owned = 0;
-        pthread_mutex_unlock(&x->lock);
-        if (!ok || x->j->stop || g_quit || x->failed) break;
-        c->index = claim(x);
-        if (c->index < 0) break;
-    }
-    if (c->h) curl_easy_cleanup(c->h);
-    pthread_mutex_lock(&x->lock);
-    if (!ok) x->failed = 1;
-    x->live--;
-    pthread_cond_broadcast(&x->cv);
-    pthread_mutex_unlock(&x->lock);
-    free(c->buf);
-    free(c);
-    return NULL;
-}
-
-// Finds the size and whether byte ranges work, with a "Range: bytes=0-0" request. Also resolves redirects.
-typedef struct {
-    long code;
-    int64_t range_total, length;
-} probe_info;
-
-static size_t probe_header(char *p, size_t sz, size_t n, void *ud) {
-    probe_info *pi = ud;
-    size_t len = sz * n;
-    char line[512];
-    size_t l = len < sizeof line - 1 ? len : sizeof line - 1;
-    memcpy(line, p, l);
-    line[l] = 0;
-    if (!strncasecmp(line, "HTTP/", 5)) pi->range_total = -1, pi->length = -1;
-    else if (!strncasecmp(line, "content-range:", 14)) {
-        char *slash = strchr(line, '/');
-        if (slash && slash[1] != '*') pi->range_total = atoll(slash + 1);
-    } else if (!strncasecmp(line, "content-length:", 15)) pi->length = atoll(line + 15);
-    return len;
-}
-
-static size_t probe_body(char *p, size_t sz, size_t n, void *ud) {
-    (void)p, (void)ud;
-    return sz * n > 1 ? 0 : sz * n; // a 200 answer would be the whole file: stop at once
-}
-
-static int probe(const char *url, int64_t *total, int *ranges, char *final_url, size_t final_len, char *err,
-                 size_t errlen) {
-    CURL *h = curl_easy_init();
-    if (!h) return -1;
-    probe_info pi = {0, -1, -1};
-    net_apply(h);
-    curl_easy_setopt(h, CURLOPT_URL, url);
-    curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(h, CURLOPT_MAXREDIRS, 10L);
-    curl_easy_setopt(h, CURLOPT_RANGE, "0-0");
-    curl_easy_setopt(h, CURLOPT_TIMEOUT, 60L);
-    curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, probe_header);
-    curl_easy_setopt(h, CURLOPT_HEADERDATA, &pi);
-    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, probe_body);
-    CURLcode rc = curl_easy_perform(h);
-    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &pi.code);
-    char *eff = NULL;
-    curl_easy_getinfo(h, CURLINFO_EFFECTIVE_URL, &eff);
-    snprintf(final_url, final_len, "%s", eff ? eff : url);
-    curl_easy_cleanup(h);
-    if (pi.code == 206) {
-        *ranges = 1;
-        *total = pi.range_total;
-    } else if (pi.code == 200) {
-        *ranges = 0;
-        *total = pi.length;
-    } else {
-        if (pi.code >= 400) snprintf(err, errlen, "HTTP %ld", pi.code);
-        else snprintf(err, errlen, "%s", curl_easy_strerror(rc));
-        return pi.code >= 400 && pi.code != 429 && pi.code != 503 ? -2 : -1;
-    }
-    return 0;
-}
+    int64_t last_progress_ms, stall_ms, low_speed_time;
+    int64_t grace_until_ms;
+};
 
 static void state_path(const job *j, char *out, size_t len) { snprintf(out, len, "%s.part.state", j->path); }
 
@@ -474,11 +276,11 @@ static int load_state(xfer *x, int64_t total) {
     }
     fclose(f);
     if (!ok) return -1;
-    int k = 0; // drop finished segments: the table only needs what is left
+    int k = 0;
     for (int i = 0; i < n; i++)
         if (x->segs[i].pos <= x->segs[i].end) x->segs[k++] = x->segs[i];
     for (int i = 0; i < k; i++) x->segs[i].seen = x->segs[i].pos;
-    if (k == 0) { // all done: keep one empty segment so the table stays valid
+    if (k == 0) {
         x->segs[0].start = x->segs[0].pos = x->segs[0].seen = total, x->segs[0].end = total - 1;
         k = 1;
     }
@@ -492,7 +294,7 @@ static void save_state(xfer *x, int64_t total) {
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "w");
     if (!f) return;
-    pthread_mutex_lock(&x->lock);
+    pthread_mutex_lock(&x->state_lock);
     fprintf(f, "torbox-ps5 1 %lld %d\n", (long long)total, x->nseg);
     for (int i = 0; i < x->nseg; i++) {
         int64_t end = __atomic_load_n(&x->segs[i].end, __ATOMIC_ACQUIRE);
@@ -500,162 +302,1155 @@ static void save_state(xfer *x, int64_t total) {
         fprintf(f, "%lld %lld %lld\n", (long long)x->segs[i].start, (long long)end,
                 (long long)(pos > end + 1 ? end + 1 : pos));
     }
-    pthread_mutex_unlock(&x->lock);
+    pthread_mutex_unlock(&x->state_lock);
     fclose(f);
     rename(tmp, path);
 }
 
-// Bytes done: on disk (seen = 0) or received (seen = 1, for the progress display). The segment table only
-// covers what was left when the job started, so a segmented job counts total minus what is still missing.
-static int64_t xfer_done(xfer *x, int single, int seen, int64_t total) {
-    if (single) {
+static void on_writer_commit(void *ctx, int seg_idx, int64_t new_pos) {
+    xfer *x = ctx;
+    if (seg_idx < 0 || seg_idx >= MAX_SEGS) return;
+    int64_t cur = __atomic_load_n(&x->segs[seg_idx].pos, __ATOMIC_RELAXED);
+    if (new_pos > cur) __atomic_store_n(&x->segs[seg_idx].pos, new_pos, __ATOMIC_RELEASE);
+}
+
+static void on_writer_state(void *ctx) {
+    xfer *x = ctx;
+    if (!x->single) save_state(x, x->total);
+}
+
+static int64_t xfer_done(xfer *x, int seen) {
+    if (x->single) {
         int64_t p = __atomic_load_n(&x->segs[0].pos, __ATOMIC_RELAXED);
-        int64_t r = __atomic_load_n(&x->segs[0].seen, __ATOMIC_RELAXED);
+        int64_t r = x->segs[0].seen;
         return seen && r > p ? r : p;
     }
+    if (x->usb_mode) {
+        if (!seen) return __atomic_load_n(&x->segs[0].pos, __ATOMIC_RELAXED);
+        int64_t total_seen = x->usb_cursor;
+        for (int i = 0; i < x->nslots; i++) {
+            slot *sl = &x->slots[i];
+            if (sl->usb_assigned && sl->win_used > sl->win_drained)
+                total_seen += (int64_t)(sl->win_used - sl->win_drained);
+        }
+        return total_seen;
+    }
     int64_t left = 0;
-    int n = __atomic_load_n(&x->nseg, __ATOMIC_ACQUIRE);
-    for (int i = 0; i < n; i++) {
-        int64_t end = __atomic_load_n(&x->segs[i].end, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < x->nseg; i++) {
+        int64_t end = x->segs[i].end;
         int64_t p = __atomic_load_n(&x->segs[i].pos, __ATOMIC_RELAXED);
-        int64_t r = __atomic_load_n(&x->segs[i].seen, __ATOMIC_RELAXED);
+        int64_t r = x->segs[i].seen;
         int64_t at = seen && r > p ? r : p;
         if (at <= end) left += end + 1 - at;
     }
-    return total - left;
+    return x->total - left;
+}
+
+static void record_http_version(xfer *x, CURL *h) {
+    if (x->http_ver[0]) return;
+    long v = 0;
+    if (curl_easy_getinfo(h, CURLINFO_HTTP_VERSION, &v) != CURLE_OK) return;
+    if (v == CURL_HTTP_VERSION_1_0) snprintf(x->http_ver, sizeof x->http_ver, "1.0");
+    else if (v == CURL_HTTP_VERSION_1_1) snprintf(x->http_ver, sizeof x->http_ver, "1.1");
+    else if (v == CURL_HTTP_VERSION_2_0 || v == CURL_HTTP_VERSION_2TLS || v == CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE)
+        snprintf(x->http_ver, sizeof x->http_ver, "2.0");
+    else if (v == CURL_HTTP_VERSION_3 || v == CURL_HTTP_VERSION_3ONLY)
+        snprintf(x->http_ver, sizeof x->http_ver, "3");
+}
+
+static void trim_hdr(const char *s, size_t n, char *out, size_t cap) {
+    while (n && (*s == ' ' || *s == '\t')) s++, n--;
+    while (n && (s[n - 1] == '\r' || s[n - 1] == '\n' || s[n - 1] == ' ' || s[n - 1] == '\t')) n--;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, s, n);
+    out[n] = 0;
+}
+
+static int parse_retry_after(const char *val) {
+    char *end = NULL;
+    long sec = strtol(val, &end, 10);
+    if (end && end != val && (*end == 0 || *end == ' ')) {
+        if (sec < 0) return 0;
+        return sec > 3600 ? 3600 : (int)sec;
+    }
+    time_t target = curl_getdate(val, NULL);
+    if (target != (time_t)-1) {
+        time_t now = time(NULL);
+        if (target > now) {
+            long diff = (long)(target - now);
+            return diff > 3600 ? 3600 : (int)diff;
+        }
+    }
+    return 0;
+}
+
+static size_t slot_header(char *p, size_t sz, size_t n, void *ud) {
+    slot *sl = ud;
+    size_t len = sz * n;
+    char line[512];
+    size_t l = len < sizeof line - 1 ? len : sizeof line - 1;
+    memcpy(line, p, l);
+    line[l] = 0;
+
+    if (!strncasecmp(line, "HTTP/", 5)) {
+        sl->resp_code = 0;
+        sl->resp_range_ok = sl->resp_encoding_bad = sl->resp_html = 0;
+        sl->resp_start = sl->resp_end = sl->resp_total = sl->resp_clen = -1;
+        sl->resp_retry_after = 0;
+        sl->resp_etag[0] = sl->resp_lastmod[0] = 0;
+        char *sp = strchr(line, ' ');
+        if (sp) sl->resp_code = strtol(sp + 1, NULL, 10);
+    } else if (!strncasecmp(line, "content-range:", 14)) {
+        long long a = 0, b = 0, tot = -1;
+        if (sscanf(line + 14, " bytes %lld-%lld/%lld", &a, &b, &tot) == 3) {
+            sl->resp_start = a, sl->resp_end = b, sl->resp_total = tot;
+            sl->resp_range_ok = 1;
+        }
+    } else if (!strncasecmp(line, "content-length:", 15)) {
+        sl->resp_clen = atoll(line + 15);
+    } else if (!strncasecmp(line, "content-encoding:", 17)) {
+        char enc[64];
+        trim_hdr(line + 17, l - 17, enc, sizeof enc);
+        if (enc[0] && strcasecmp(enc, "identity")) sl->resp_encoding_bad = 1;
+    } else if (!strncasecmp(line, "content-type:", 13)) {
+        char ctype[128];
+        trim_hdr(line + 13, l - 13, ctype, sizeof ctype);
+        if (!strncasecmp(ctype, "text/html", 9) || !strncasecmp(ctype, "application/xhtml+xml", 21))
+            sl->resp_html = 1;
+    } else if (!strncasecmp(line, "etag:", 5)) {
+        trim_hdr(line + 5, l - 5, sl->resp_etag, sizeof sl->resp_etag);
+    } else if (!strncasecmp(line, "last-modified:", 14)) {
+        trim_hdr(line + 14, l - 14, sl->resp_lastmod, sizeof sl->resp_lastmod);
+    } else if (!strncasecmp(line, "retry-after:", 12)) {
+        char ra[128];
+        trim_hdr(line + 12, l - 12, ra, sizeof ra);
+        sl->resp_retry_after = parse_retry_after(ra);
+    }
+    return len;
+}
+
+static void flush_slot_block(xfer *x, slot *sl) {
+    if (!sl->block) return;
+    if (sl->block_used == 0) {
+        writer_release(x->w, sl->block);
+    } else {
+        writer_enqueue(x->w, sl->block, x->single || x->usb_mode ? 0 : sl->seg_idx, sl->block_off, sl->block_used);
+    }
+    sl->block = NULL;
+    sl->block_used = 0;
+}
+
+static size_t slot_on_data(char *p, size_t sz, size_t n, void *ud) {
+    slot *sl = ud;
+    xfer *x = sl->x;
+    size_t len = sz * n;
+    if (x->j->stop || g_quit || x->failed || writer_disk_error(x->w)) return 0;
+
+    if (!sl->checked) {
+        sl->checked = 1;
+        long code = sl->resp_code;
+        if (!code) curl_easy_getinfo(sl->h, CURLINFO_RESPONSE_CODE, &code);
+        sl->resp_code = code;
+        record_http_version(x, sl->h);
+        if (x->sock_info.after > x->rcvbuf) x->rcvbuf = x->sock_info.after;
+
+        if (sl->resp_encoding_bad) {
+            sl->bad_resp = 1;
+            snprintf(sl->err, sizeof sl->err, "unexpected Content-Encoding from server");
+            return 0;
+        }
+        if (x->is_debrid && sl->resp_html) {
+            sl->bad_resp = 1;
+            snprintf(sl->err, sizeof sl->err, "provider returned an HTML page instead of the file");
+            return 0;
+        }
+        if (!x->single) {
+            if (code != 206 || !sl->resp_range_ok || sl->resp_start != sl->req_start ||
+                sl->resp_end != sl->req_end || (x->total > 0 && sl->resp_total != x->total)) {
+                sl->bad_resp = 1;
+                if (code == 200) snprintf(sl->err, sizeof sl->err, "server ignored the byte range (HTTP 200)");
+                else snprintf(sl->err, sizeof sl->err, "unexpected range response (HTTP %ld)", code);
+                return 0;
+            }
+            if ((x->etag[0] && (!sl->resp_etag[0] || strcmp(sl->resp_etag, x->etag))) ||
+                (!x->etag[0] && x->last_modified[0] && sl->resp_lastmod[0] &&
+                 strcmp(sl->resp_lastmod, x->last_modified))) {
+                sl->bad_resp = 1;
+                sl->validator_mismatch = 1;
+                snprintf(sl->err, sizeof sl->err, "server file validator changed during download");
+                return 0;
+            }
+        } else {
+            if (sl->req_start > 0 && code == 200) {
+                if (ftruncate(x->fd, 0)) { /* overwrite from 0 */ }
+                sl->cur_off = 0;
+                __atomic_store_n(&x->segs[0].pos, 0, __ATOMIC_RELAXED);
+                x->segs[0].start = 0;
+                x->segs[0].seen = 0;
+            }
+            if (code != 200 && code != 206) {
+                sl->bad_resp = 1;
+                snprintf(sl->err, sizeof sl->err, "HTTP %ld", code);
+                return 0;
+            }
+        }
+    }
+
+    if (sl->cut_done) return len; // accept and discard trailing bytes after a segment cut
+
+    int64_t cap_end = sl->req_end;
+    if (!x->single && !x->usb_mode) {
+        int64_t seg_end = __atomic_load_n(&x->segs[sl->seg_idx].end, __ATOMIC_ACQUIRE);
+        if (seg_end < cap_end) cap_end = seg_end;
+    }
+
+    size_t keep = len;
+    if (cap_end != INT64_MAX) {
+        int64_t room = cap_end + 1 - sl->cur_off;
+        if (room <= 0) {
+            sl->cut_done = 1;
+            if (!x->usb_mode) flush_slot_block(x, sl);
+            return len;
+        }
+        if ((int64_t)keep > room) keep = (size_t)room;
+    }
+
+    if (x->usb_mode) {
+        if (sl->win_used + keep > USB_CHUNK) keep = USB_CHUNK - sl->win_used;
+        if (keep > 0) {
+            memcpy(sl->win_buf + sl->win_used, p, keep);
+            sl->win_used += keep;
+            sl->cur_off += (int64_t)keep;
+        }
+        if (sl->cur_off > cap_end && cap_end != INT64_MAX) sl->cut_done = 1;
+        x->segs[0].last_data_ms = plat_now_ms();
+        return len;
+    }
+
+    // Standard mode: buffer into 128 KiB block; pause before copying if pool is exhausted so pause is lossless.
+    if (keep > 0) {
+        if (sl->block && WBLOCK_SIZE - sl->block_used < keep) flush_slot_block(x, sl);
+        if (!sl->block) {
+            sl->block = writer_take(x->w);
+            if (!sl->block) {
+                sl->paused = 1;
+                return CURL_WRITEFUNC_PAUSE;
+            }
+            sl->block_off = sl->cur_off;
+            sl->block_used = 0;
+        }
+        memcpy(sl->block->data + sl->block_used, p, keep);
+        sl->block_used += keep;
+        sl->cur_off += (int64_t)keep;
+        if (sl->block_used == WBLOCK_SIZE) flush_slot_block(x, sl);
+    }
+
+    seg *sg = &x->segs[x->single ? 0 : sl->seg_idx];
+    if (sl->cur_off > sg->seen) sg->seen = sl->cur_off;
+    sg->last_data_ms = plat_now_ms();
+    if (!x->single && sl->cur_off > cap_end && cap_end != INT64_MAX) {
+        sl->cut_done = 1;
+        flush_slot_block(x, sl);
+    }
+    return len;
+}
+
+static int slot_progress(void *ud, curl_off_t dt, curl_off_t dn, curl_off_t ut, curl_off_t un) {
+    (void)dt, (void)dn, (void)ut, (void)un;
+    slot *sl = ud;
+    xfer *x = sl->x;
+    return x->j->stop || g_quit || x->failed || writer_disk_error(x->w) != 0;
+}
+
+// Probe on the transfer's multi handle (keeps the TCP+TLS connection warm for the first chunk).
+typedef struct {
+    long code;
+    int64_t range_total, length;
+    int bad_enc, is_html;
+    char etag[256], last_modified[128];
+} probe_info;
+
+static size_t probe_header(char *p, size_t sz, size_t n, void *ud) {
+    probe_info *pi = ud;
+    size_t len = sz * n;
+    char line[512];
+    size_t l = len < sizeof line - 1 ? len : sizeof line - 1;
+    memcpy(line, p, l);
+    line[l] = 0;
+    if (!strncasecmp(line, "HTTP/", 5)) {
+        pi->range_total = -1, pi->length = -1;
+        pi->bad_enc = pi->is_html = 0;
+        pi->etag[0] = pi->last_modified[0] = 0;
+        char *sp = strchr(line, ' ');
+        if (sp) pi->code = strtol(sp + 1, NULL, 10);
+    } else if (!strncasecmp(line, "content-range:", 14)) {
+        char *slash = strchr(line, '/');
+        if (slash && slash[1] != '*') pi->range_total = atoll(slash + 1);
+    } else if (!strncasecmp(line, "content-length:", 15)) {
+        pi->length = atoll(line + 15);
+    } else if (!strncasecmp(line, "content-encoding:", 17)) {
+        char enc[64];
+        trim_hdr(line + 17, l - 17, enc, sizeof enc);
+        if (enc[0] && strcasecmp(enc, "identity")) pi->bad_enc = 1;
+    } else if (!strncasecmp(line, "content-type:", 13)) {
+        char ct[128];
+        trim_hdr(line + 13, l - 13, ct, sizeof ct);
+        if (!strncasecmp(ct, "text/html", 9) || !strncasecmp(ct, "application/xhtml+xml", 21)) pi->is_html = 1;
+    } else if (!strncasecmp(line, "etag:", 5)) {
+        trim_hdr(line + 5, l - 5, pi->etag, sizeof pi->etag);
+    } else if (!strncasecmp(line, "last-modified:", 14)) {
+        trim_hdr(line + 14, l - 14, pi->last_modified, sizeof pi->last_modified);
+    }
+    return len;
+}
+
+static size_t probe_body(char *p, size_t sz, size_t n, void *ud) {
+    (void)p;
+    probe_info *pi = ud;
+    if (pi->code != 206) return 0; // abort 200 / error responses immediately
+    return sz * n > 1 ? 0 : sz * n;
+}
+
+static int probe(xfer *x, const char *url, int64_t *total, int *ranges, char *final_url, size_t final_len, char *err,
+                 size_t errlen) {
+    CURL *h = x->slots[0].h;
+    if (!h) return -1;
+    probe_info pi = {0, -1, -1, 0, 0, {0}, {0}};
+    curl_easy_reset(h);
+    net_apply_dl(h, &x->sock_info);
+    curl_easy_setopt(h, CURLOPT_URL, url);
+    curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(h, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(h, CURLOPT_RANGE, "0-0");
+    curl_easy_setopt(h, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, probe_header);
+    curl_easy_setopt(h, CURLOPT_HEADERDATA, &pi);
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, probe_body);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &pi);
+    curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, slot_progress);
+    curl_easy_setopt(h, CURLOPT_XFERINFODATA, &x->slots[0]);
+    curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
+
+    if (curl_multi_add_handle(x->multi, h) != CURLM_OK) {
+        snprintf(err, errlen, "cannot schedule probe");
+        return -1;
+    }
+    CURLcode rc = CURLE_OK;
+    int done = 0;
+    while (!done && !x->j->stop && !g_quit) {
+        int running = 0;
+        CURLMcode mrc = curl_multi_perform(x->multi, &running);
+        if (mrc != CURLM_OK) {
+            rc = CURLE_FAILED_INIT;
+            break;
+        }
+        int left = 0;
+        CURLMsg *msg;
+        while ((msg = curl_multi_info_read(x->multi, &left))) {
+            if (msg->msg == CURLMSG_DONE && msg->easy_handle == h) {
+                rc = msg->data.result;
+                done = 1;
+            }
+        }
+        if (!done) curl_multi_poll(x->multi, NULL, 0, 50, NULL);
+    }
+    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &pi.code);
+    char *eff = NULL;
+    curl_easy_getinfo(h, CURLINFO_EFFECTIVE_URL, &eff);
+    snprintf(final_url, final_len, "%s", eff ? eff : url);
+    record_http_version(x, h);
+    if (x->sock_info.after > x->rcvbuf) x->rcvbuf = x->sock_info.after;
+    curl_multi_remove_handle(x->multi, h);
+
+    if (x->j->stop || g_quit) return -3;
+    if (pi.code == 206 || pi.code == 200) {
+        if (pi.bad_enc) {
+            snprintf(err, errlen, "server sent unsupported Content-Encoding");
+            return -2;
+        }
+        if (x->is_debrid && pi.is_html) {
+            snprintf(err, errlen, "provider returned an HTML page instead of a file");
+            return -2;
+        }
+    }
+    if (pi.code == 206) {
+        *ranges = 1;
+        *total = pi.range_total;
+        if (pi.etag[0] && strncmp(pi.etag, "W/", 2)) snprintf(x->etag, sizeof x->etag, "%s", pi.etag);
+        else if (pi.last_modified[0]) snprintf(x->last_modified, sizeof x->last_modified, "%s", pi.last_modified);
+        return 0;
+    }
+    if (pi.code == 200) {
+        *ranges = 0;
+        *total = pi.length;
+        return 0;
+    }
+    if (pi.code >= 400) snprintf(err, errlen, "HTTP %ld", pi.code);
+    else snprintf(err, errlen, "%s", curl_easy_strerror(rc));
+    // On TorBox/RD, unreachable/4xx/5xx CDN probes trigger a fresh requestdl link.
+    if (pi.code >= 400 && pi.code != 429 && pi.code != 503) return -2;
+    if (x->is_debrid && pi.code == 0) return -2;
+    return -1;
+}
+
+// Claims an unowned segment, or tail-splits the largest active segment with >= SPLIT_MIN left.
+static int claim_seg(xfer *x, int64_t now) {
+    int best = -1;
+    int64_t best_left = 0;
+    for (int i = 0; i < x->nseg; i++) {
+        seg *s = &x->segs[i];
+        int64_t end = s->end;
+        int64_t pos = __atomic_load_n(&s->pos, __ATOMIC_RELAXED);
+        int64_t at = s->seen > pos ? s->seen : pos;
+        if (!s->owned && pos <= end) {
+            if (now >= s->retry_at_ms) {
+                s->owned = 1;
+                s->waiting = 0;
+                return i;
+            }
+            continue;
+        }
+        if (s->owned && end - at > best_left) best = i, best_left = end - at;
+    }
+    if (best >= 0 && best_left >= SPLIT_MIN && x->nseg < MAX_SEGS) {
+        pthread_mutex_lock(&x->state_lock);
+        seg *s = &x->segs[best];
+        int64_t at = s->seen;
+        int64_t pos = __atomic_load_n(&s->pos, __ATOMIC_RELAXED);
+        if (at < pos) at = pos;
+        int64_t left = s->end - at;
+        if (left >= SPLIT_MIN) {
+            int64_t mid = at + left / 2;
+            int got = x->nseg;
+            seg *n = &x->segs[got];
+            memset(n, 0, sizeof *n);
+            n->start = n->pos = n->seen = mid + 1;
+            n->end = s->end;
+            n->owned = 1;
+            n->last_data_ms = now;
+            __atomic_store_n(&s->end, mid, __ATOMIC_RELEASE);
+            x->nseg = got + 1;
+            pthread_mutex_unlock(&x->state_lock);
+            return got;
+        }
+        pthread_mutex_unlock(&x->state_lock);
+    }
+    return -1;
+}
+
+static int start_slot_request(xfer *x, slot *sl, int seg_idx, int64_t start, int64_t end) {
+    CURL *h = sl->h;
+    curl_easy_reset(h);
+    if (sl->hdrs) {
+        curl_slist_free_all(sl->hdrs);
+        sl->hdrs = NULL;
+    }
+    net_apply_dl(h, &x->sock_info);
+    curl_easy_setopt(h, CURLOPT_BUFFERSIZE, 64L * 1024); // strictly <= WBLOCK_SIZE so pause is lossless
+    curl_easy_setopt(h, CURLOPT_URL, x->url);
+    curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(h, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(h, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 16384L);
+    curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, (long)x->low_speed_time);
+    curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, slot_header);
+    curl_easy_setopt(h, CURLOPT_HEADERDATA, sl);
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, slot_on_data);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, sl);
+    curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, slot_progress);
+    curl_easy_setopt(h, CURLOPT_XFERINFODATA, sl);
+    curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
+
+    if (!x->single) {
+        char range[64];
+        snprintf(range, sizeof range, "%lld-%lld", (long long)start, (long long)end);
+        curl_easy_setopt(h, CURLOPT_RANGE, range);
+        const char *val = x->etag[0] ? x->etag : x->last_modified[0] ? x->last_modified : NULL;
+        if (val) {
+            char ifr[300];
+            snprintf(ifr, sizeof ifr, "If-Range: %s", val);
+            sl->hdrs = curl_slist_append(sl->hdrs, ifr);
+            if (sl->hdrs) curl_easy_setopt(h, CURLOPT_HTTPHEADER, sl->hdrs);
+        }
+    } else if (start > 0) {
+        curl_easy_setopt(h, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)start);
+    }
+
+    sl->seg_idx = seg_idx;
+    sl->req_start = sl->cur_off = start;
+    sl->req_end = end;
+    sl->checked = sl->paused = sl->cut_done = 0;
+    sl->bad_resp = sl->validator_mismatch = 0;
+    sl->resp_code = 0;
+    sl->resp_range_ok = sl->resp_encoding_bad = sl->resp_html = 0;
+    sl->resp_retry_after = 0;
+    sl->err[0] = 0;
+    sl->block_used = 0;
+
+    if (curl_multi_add_handle(x->multi, h) != CURLM_OK) {
+        snprintf(x->err, sizeof x->err, "curl_multi_add_handle failed");
+        return -1;
+    }
+    sl->active = 1;
+    return 0;
+}
+
+static void aimd_grow(xfer *x, int in_flight, int64_t now) {
+    if (x->single || x->win_allowed >= x->max_conns) return;
+    if (now < x->win_paused_until_ms) return;
+    if (in_flight + x->win_allowed / 10 < x->win_allowed) return;
+    if (now - x->win_grown_ms < 1000 || now - x->win_shrunk_ms < 3000) return;
+    int step = x->win_congested ? 1 : (x->win_allowed / 2 > 2 ? x->win_allowed / 2 : 2);
+    x->win_allowed += step;
+    if (x->win_allowed > x->max_conns) x->win_allowed = x->max_conns;
+    x->win_grown_ms = now;
+}
+
+static void aimd_shrink(xfer *x, int in_flight, int retry_after, int64_t now) {
+    if (retry_after > 0) {
+        int cap = x->is_debrid ? 300 : 60;
+        if (retry_after > cap) retry_after = cap;
+        int64_t until = now + (int64_t)retry_after * 1000;
+        if (until > x->win_paused_until_ms) x->win_paused_until_ms = until;
+    }
+    if (x->win_congested && now - x->win_shrunk_ms < 2000) return;
+    int cur = x->win_allowed < in_flight + 1 ? x->win_allowed : in_flight + 1;
+    x->win_allowed = cur / 2 > 1 ? cur / 2 : 1;
+    x->win_congested = 1;
+    x->win_shrunk_ms = x->win_grown_ms = now;
+}
+
+static int congested_error(long code, CURLcode rc) {
+    if (code == 408 || code == 429 || (code >= 500 && code <= 599)) return 1;
+    switch (rc) {
+    case CURLE_RECV_ERROR: case CURLE_SEND_ERROR: case CURLE_OPERATION_TIMEDOUT:
+    case CURLE_PARTIAL_FILE: case CURLE_COULDNT_CONNECT: case CURLE_GOT_NOTHING:
+    case CURLE_SSL_CONNECT_ERROR: case CURLE_COULDNT_RESOLVE_HOST:
+        return 1;
+    default: return 0;
+    }
 }
 
 enum { T_OK, T_STOPPED, T_RETRY, T_FATAL, T_RELINK };
 
-// Downloads url into j->path.part. Returns T_*.
 static int transfer(job *j, const char *url, char *err, size_t errlen) {
     char final_url[4096], part[1900];
-    int64_t total = -1;
-    int ranges = 0;
-    int pr = probe(url, &total, &ranges, final_url, sizeof final_url, err, errlen);
-    if (pr == -2) return T_RELINK;
-    if (pr) return T_RETRY;
-    snprintf(part, sizeof part, "%s.part", j->path);
     xfer *x = calloc(1, sizeof *x);
     if (!x) return T_FATAL;
-    x->j = j, x->url = final_url;
-    pthread_mutex_init(&x->lock, NULL);
-    pthread_cond_init(&x->cv, NULL);
-    int conns = g_connections;
+    x->j = j;
+    pthread_mutex_init(&x->state_lock, NULL);
+    x->is_debrid = net_is_debrid_cdn(url) || !strcmp(j->kind, "torrents") || !strcmp(j->kind, "webdl") ||
+                   !strcmp(j->kind, "usenet") || !strcmp(j->kind, "rd");
+    x->stall_ms = test_env_int("TORBOX_STALL_MS", 30000);
+    x->low_speed_time = test_env_int("TORBOX_LOW_SPEED_TIME", 20);
+
+    x->multi = curl_multi_init();
+    if (!x->multi) {
+        pthread_mutex_destroy(&x->state_lock);
+        free(x);
+        return T_FATAL;
+    }
+    curl_multi_setopt(x->multi, CURLMOPT_PIPELINING, 0L);
+
+    x->slots[0].x = x;
+    x->slots[0].h = curl_easy_init();
+    if (!x->slots[0].h) {
+        curl_multi_cleanup(x->multi);
+        pthread_mutex_destroy(&x->state_lock);
+        free(x);
+        return T_FATAL;
+    }
+
+    int64_t total = -1;
+    int ranges = 0;
+    int pr = probe(x, url, &total, &ranges, final_url, sizeof final_url, err, errlen);
+    if (pr != 0) {
+        curl_easy_cleanup(x->slots[0].h);
+        curl_multi_cleanup(x->multi);
+        pthread_mutex_destroy(&x->state_lock);
+        free(x);
+        return pr == -3 ? T_STOPPED : pr == -2 ? T_RELINK : T_RETRY;
+    }
+
+    x->url = final_url;
+    x->total = total;
+    net_host_of(final_url, x->cdn, sizeof x->cdn);
+    if (net_is_debrid_cdn(final_url)) x->is_debrid = 1;
+
+    int conns = g_connections == 0 ? (x->is_debrid ? DEBRID_AUTO_CONNS : MAX_CONNS) : g_connections;
     if (j->max_conns > 0 && conns > j->max_conns) conns = j->max_conns;
+    if (conns < 1) conns = 1;
+    if (conns > MAX_CONNS) conns = MAX_CONNS;
+
+    snprintf(part, sizeof part, "%s.part", j->path);
     struct stat st;
     int64_t have = stat(part, &st) ? 0 : st.st_size;
-    // A segment table from an earlier run is always continued (whatever the connection count is now): a single
-    // stream cannot fill its holes.
     int resumed = ranges && total > 0 && load_state(x, total) == 0 && have > 0;
     int single = !resumed && !(ranges && total >= MULTI_MIN && conns > 1);
+    x->single = single;
+    x->usb_mode = !single && plat_is_usb_path(j->path);
+
     if (single) {
         x->nseg = 1;
         x->segs[0].start = 0;
         x->segs[0].end = total > 0 ? total - 1 : INT64_MAX;
-        // A state file means the part has holes; a single stream cannot resume those.
         char sp[1900];
         state_path(j, sp, sizeof sp);
         if (!stat(sp, &st) && unlink(sp) == 0) have = 0, unlink(part);
         if (!ranges || (total > 0 && have > total)) have = 0, unlink(part);
         x->segs[0].pos = x->segs[0].seen = have;
-        if (total > 0 && have == total) { // already complete
+        if (total > 0 && have == total) {
+            curl_easy_cleanup(x->slots[0].h);
+            curl_multi_cleanup(x->multi);
+            pthread_mutex_destroy(&x->state_lock);
             free(x);
             return T_OK;
         }
-    } else if (!resumed) {
-        int n = conns < MAX_CONNS ? conns : MAX_CONNS;
-        if (n < 1) n = 1;
+    } else if (x->usb_mode) {
+        // USB/exFAT mode: collapse any resumed segments only if nseg == 1, or keep resumed table?
+        // If a prior non-USB partial exists with multiple segments, keep standard mode to fill its holes safely.
+        if (resumed && x->nseg > 1) {
+            x->usb_mode = 0;
+        } else {
+            if (!resumed) {
+                unlink(part);
+                x->nseg = 1;
+                x->segs[0].start = 0;
+                x->segs[0].end = total - 1;
+                x->segs[0].pos = x->segs[0].seen = 0;
+            }
+            x->usb_cursor = x->usb_next_issue = x->segs[0].pos;
+            if (conns > USB_WIN_SLOTS) conns = USB_WIN_SLOTS;
+        }
+    }
+    if (!single && !x->usb_mode && !resumed) {
+        int n = conns;
         x->nseg = n;
-        unlink(part); // any old part without a matching table cannot be trusted
+        unlink(part);
         for (int i = 0; i < n; i++) {
             x->segs[i].start = total * i / n;
             x->segs[i].end = total * (i + 1) / n - 1;
             x->segs[i].pos = x->segs[i].seen = x->segs[i].start;
         }
     }
+
     x->fd = open(part, O_RDWR | O_CREAT, 0666);
     if (x->fd < 0) {
         snprintf(err, errlen, "cannot create %s: %s", part, strerror(errno));
+        curl_easy_cleanup(x->slots[0].h);
+        curl_multi_cleanup(x->multi);
+        pthread_mutex_destroy(&x->state_lock);
         free(x);
         return T_FATAL;
     }
     if (!single) save_state(x, total);
+
+    x->max_conns = single ? 1 : conns;
+    x->nslots = x->max_conns;
+    x->win_allowed = single ? 1 : (x->max_conns < 8 ? x->max_conns : 8);
+    curl_multi_setopt(x->multi, CURLMOPT_MAXCONNECTS, (long)(x->max_conns + 2));
+    curl_multi_setopt(x->multi, CURLMOPT_MAX_HOST_CONNECTIONS, (long)x->max_conns);
+    curl_multi_setopt(x->multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, (long)x->max_conns);
+
+    for (int i = 0; i < x->nslots; i++) {
+        x->slots[i].x = x;
+        if (i > 0) x->slots[i].h = curl_easy_init();
+        if (!x->slots[i].h) {
+            x->nslots = i;
+            break;
+        }
+        if (x->usb_mode) {
+            x->slots[i].win_buf = malloc(USB_CHUNK);
+            if (!x->slots[i].win_buf) {
+                curl_easy_cleanup(x->slots[i].h);
+                x->nslots = i;
+                break;
+            }
+        }
+    }
+    if (x->nslots < 1) {
+        close(x->fd);
+        curl_multi_cleanup(x->multi);
+        pthread_mutex_destroy(&x->state_lock);
+        free(x);
+        return T_FATAL;
+    }
+    if (x->max_conns > x->nslots) x->max_conns = x->nslots;
+    if (x->win_allowed > x->max_conns) x->win_allowed = x->max_conns;
+
+    int pool_blocks = x->usb_mode ? WPOOL_COMPACT : WPOOL_MAX;
+    x->w = writer_start(x->fd, pool_blocks, x->multi, on_writer_commit, on_writer_state, x);
+    if (!x->w) {
+        for (int i = 0; i < x->nslots; i++) curl_easy_cleanup(x->slots[i].h), free(x->slots[i].win_buf);
+        close(x->fd);
+        curl_multi_cleanup(x->multi);
+        pthread_mutex_destroy(&x->state_lock);
+        free(x);
+        return T_FATAL;
+    }
+
+    int64_t now0 = plat_now_ms();
+    x->win_grown_ms = x->last_progress_ms = now0;
+    int64_t last_loop_ms = now0, last_ui_ms = now0, last_log_ms = now0;
+    int64_t last_recv_done = xfer_done(x, 0), log_recv = last_recv_done, log_disk = last_recv_done;
+    int64_t ui_recv = last_recv_done;
+    double recv_speed = 0, disk_speed = 0;
+
     pthread_mutex_lock(&g_lock);
     j->total = total;
-    j->done = xfer_done(x, single, 0, total);
+    j->done = last_recv_done;
     j->start_done = j->done;
     j->state = J_RUNNING;
+    j->usb_mode = x->usb_mode;
+    j->rcvbuf = x->rcvbuf;
+    snprintf(j->http_ver, sizeof j->http_ver, "%s", x->http_ver);
+    snprintf(j->cdn, sizeof j->cdn, "%s", x->cdn);
     pthread_mutex_unlock(&g_lock);
 
-    int started = 0;
-    for (int i = 0; i < (single ? 1 : conns); i++) {
-        int index = single ? -1 : claim(x);
-        if (!single && index < 0) break;
-        conn *c = calloc(1, sizeof *c);
-        char *buf = c ? malloc(WBUF) : NULL;
-        if (!buf) {
-            free(c);
-            if (!started) x->failed = 1;
-            if (index >= 0) x->segs[index].owned = 0;
+    plat_log("job %d: transfer %lld bytes conns=%d rcvbuf=%dKiB http=%s host=%s%s", j->id, (long long)total,
+             x->max_conns, x->rcvbuf / 1024, x->http_ver[0] ? x->http_ver : "?",
+             x->cdn[0] ? x->cdn : "-", x->usb_mode ? " usb=seq" : "");
+
+    int64_t multi_busy_us = 0;
+
+    for (;;) {
+        int64_t now = plat_now_ms();
+        if (now - last_loop_ms > 10000) {
+            x->grace_until_ms = now + 60000;
+            x->last_progress_ms = now;
+            plat_log("job %d: resumed after suspension, waiving transient drops for 60s", j->id);
+        }
+        last_loop_ms = now;
+
+        if (j->stop || g_quit || x->failed || writer_disk_error(x->w)) break;
+
+        // 1. Drain completed USB chunks strictly in ascending offset order
+        if (x->usb_mode) {
+            int progressed = 1;
+            while (progressed) {
+                progressed = 0;
+                for (int i = 0; i < x->nslots; i++) {
+                    slot *sl = &x->slots[i];
+                    if (!sl->usb_assigned || !sl->usb_ready || sl->chunk_start != x->usb_cursor) continue;
+                    while (sl->win_drained < sl->win_used) {
+                        wblock *b = writer_take(x->w);
+                        if (!b) break;
+                        size_t take = sl->win_used - sl->win_drained;
+                        if (take > WBLOCK_SIZE) take = WBLOCK_SIZE;
+                        memcpy(b->data, sl->win_buf + sl->win_drained, take);
+                        writer_enqueue(x->w, b, 0, x->usb_cursor, take);
+                        sl->win_drained += take;
+                        x->usb_cursor += (int64_t)take;
+                        x->segs[0].seen = x->usb_cursor;
+                    }
+                    if (sl->win_drained == sl->win_used) {
+                        sl->usb_ready = 0;
+                        sl->usb_assigned = 0;
+                        progressed = 1;
+                    }
+                    break;
+                }
+            }
+        }
+
+        // 2. Cleanly detach cut slots & unpause slots whose writer pool freed blocks
+        int has_free_block = x->usb_mode ? 1 : writer_has_free(x->w);
+        for (int i = 0; i < x->nslots; i++) {
+            slot *sl = &x->slots[i];
+            if (sl->active && sl->cut_done) {
+                curl_multi_remove_handle(x->multi, sl->h);
+                flush_slot_block(x, sl);
+                sl->active = sl->cut_done = 0;
+                if (!x->single && !x->usb_mode) x->segs[sl->seg_idx].owned = 0;
+            } else if (sl->active && sl->paused && has_free_block) {
+                sl->paused = 0;
+                CURLcode prc = curl_easy_pause(sl->h, CURLPAUSE_CONT);
+                if (prc != CURLE_OK) {
+                    x->failed = 1;
+                    snprintf(x->err, sizeof x->err, "%s", curl_easy_strerror(prc));
+                    break;
+                }
+            }
+        }
+        if (x->failed) break;
+
+        // 3. Check completion & count in-flight
+        int in_flight = 0;
+        for (int i = 0; i < x->nslots; i++) {
+            if (x->slots[i].active) in_flight++;
+        }
+
+        int all_done = 0;
+        if (x->single) {
+            all_done = in_flight == 0 && (x->total >= 0 ? x->segs[0].seen >= x->total : x->segs[0].owned == 2);
+        } else if (x->usb_mode) {
+            int usb_busy = 0;
+            for (int i = 0; i < x->nslots; i++)
+                if (x->slots[i].usb_assigned || x->slots[i].active) usb_busy++;
+            all_done = usb_busy == 0 && x->usb_cursor >= total && x->usb_next_issue >= total;
+        } else {
+            all_done = 1;
+            for (int i = 0; i < x->nseg; i++) {
+                int64_t pos = __atomic_load_n(&x->segs[i].pos, __ATOMIC_RELAXED);
+                int64_t at = x->segs[i].seen > pos ? x->segs[i].seen : pos;
+                if (at <= x->segs[i].end) {
+                    all_done = 0;
+                    break;
+                }
+            }
+            if (all_done && in_flight > 0) all_done = 0;
+        }
+        if (all_done) break;
+
+        // 4. Grow AIMD window & schedule free slots
+        aimd_grow(x, in_flight, now);
+
+        if (now >= x->win_paused_until_ms) {
+            for (int i = 0; i < x->nslots && in_flight < x->win_allowed; i++) {
+                slot *sl = &x->slots[i];
+                if (sl->active) continue;
+
+                if (x->single) {
+                    if (x->segs[0].owned == 2) continue;
+                    if (x->segs[0].owned == 0 && now >= x->segs[0].retry_at_ms) {
+                        x->segs[0].owned = 1;
+                        x->segs[0].waiting = 0;
+                        int64_t s0 = x->segs[0].seen;
+                        if (start_slot_request(x, sl, 0, s0, total > 0 ? total - 1 : INT64_MAX) == 0) in_flight++;
+                        else { x->failed = 1; break; }
+                    }
+                    continue;
+                }
+
+                if (x->usb_mode) {
+                    if (sl->usb_ready) continue;
+                    if (sl->usb_assigned) {
+                        if (now < sl->usb_retry_at_ms) continue;
+                        if (start_slot_request(x, sl, 0, sl->chunk_start + (int64_t)sl->win_used, sl->chunk_end) == 0)
+                            in_flight++;
+                        else { x->failed = 1; break; }
+                        continue;
+                    }
+                    if (x->usb_next_issue < total && x->usb_next_issue - x->usb_cursor < (int64_t)x->nslots * USB_CHUNK) {
+                        int64_t start = x->usb_next_issue;
+                        int64_t end = start + USB_CHUNK - 1;
+                        if (end >= total) end = total - 1;
+                        x->usb_next_issue = end + 1;
+                        sl->usb_assigned = 1;
+                        sl->usb_ready = 0;
+                        sl->chunk_start = start;
+                        sl->chunk_end = end;
+                        sl->win_used = sl->win_drained = 0;
+                        sl->usb_attempts = sl->usb_busy_retries = 0;
+                        sl->usb_retry_at_ms = 0;
+                        if (start_slot_request(x, sl, 0, start, end) == 0) in_flight++;
+                        else { x->failed = 1; break; }
+                    }
+                    continue;
+                }
+
+                // Standard segmented mode
+                int seg_idx = claim_seg(x, now);
+                if (seg_idx < 0) break;
+                seg *sg = &x->segs[seg_idx];
+                int64_t start = sg->seen;
+                int64_t pos = __atomic_load_n(&sg->pos, __ATOMIC_RELAXED);
+                if (pos > start) start = pos;
+                int64_t end = sg->end;
+                if (end - start + 1 > CHUNK_CAP) end = start + CHUNK_CAP - 1;
+                if (start > sg->end) {
+                    sg->owned = 0;
+                    continue;
+                }
+                if (start_slot_request(x, sl, seg_idx, start, end) == 0) in_flight++;
+                else {
+                    sg->owned = 0;
+                    x->failed = 1;
+                    break;
+                }
+            }
+        }
+        if (x->failed) break;
+
+        // 5. Perform curl_multi I/O
+        int running = 0;
+        int64_t t0 = plat_now_us();
+        CURLMcode mrc = curl_multi_perform(x->multi, &running);
+        multi_busy_us += plat_now_us() - t0;
+        if (mrc != CURLM_OK) {
+            x->failed = 1;
+            snprintf(x->err, sizeof x->err, "%s", curl_multi_strerror(mrc));
             break;
         }
-        c->x = x, c->index = index, c->buf = buf;
-        pthread_mutex_lock(&x->lock);
-        x->live++;
-        pthread_mutex_unlock(&x->lock);
-        if (plat_start_thread(conn_thread, c)) {
-            pthread_mutex_lock(&x->lock);
-            x->live--;
-            if (!started) x->failed = 1;
-            if (index >= 0) x->segs[index].owned = 0;
-            pthread_mutex_unlock(&x->lock);
-            free(buf), free(c);
+
+        // 6. Process finished easy handles
+        int left = 0;
+        CURLMsg *msg;
+        while ((msg = curl_multi_info_read(x->multi, &left))) {
+            if (msg->msg != CURLMSG_DONE) continue;
+            CURL *eh = msg->easy_handle;
+            slot *sl = NULL;
+            for (int i = 0; i < x->nslots; i++)
+                if (x->slots[i].h == eh) { sl = &x->slots[i]; break; }
+            curl_multi_remove_handle(x->multi, eh);
+            if (!sl) continue;
+
+            sl->active = 0;
+            CURLcode rc = msg->data.result;
+            long code = sl->resp_code;
+            if (!code) curl_easy_getinfo(eh, CURLINFO_RESPONSE_CODE, &code);
+            if (code) x->last_code = code;
+
+            if (!x->usb_mode) flush_slot_block(x, sl);
+
+            if (j->stop || g_quit || writer_disk_error(x->w)) break;
+
+            int64_t got = sl->cur_off - sl->req_start;
+            int chunk_ok = (rc == CURLE_OK && !sl->bad_resp &&
+                            (x->single ? (x->total < 0 || sl->cur_off >= x->total) : sl->cur_off > sl->req_end));
+            if (sl->cut_done && !sl->bad_resp) chunk_ok = 1;
+
+            if (chunk_ok) {
+                if (x->single) {
+                    x->segs[0].owned = 2; // single stream complete
+                } else if (x->usb_mode) {
+                    sl->usb_ready = 1;
+                } else {
+                    seg *sg = &x->segs[sl->seg_idx];
+                    sg->owned = 0;
+                    sg->attempts = sg->busy_retries = 0;
+                }
+                continue;
+            }
+
+            // Failure or partial response handling
+            if (sl->validator_mismatch) {
+                x->failed = 1;
+                x->relink_needed = 1;
+                snprintf(x->err, sizeof x->err, "%s", sl->err);
+                break;
+            }
+            if (sl->bad_resp && code != 200) { // HTML/encoding error
+                x->failed = 1;
+                x->relink_needed = 1;
+                snprintf(x->err, sizeof x->err, "%s", sl->err);
+                break;
+            }
+            if (code == 401 || code == 403 || code == 404 || code == 410 ||
+                (rc == CURLE_HTTP_RETURNED_ERROR && code >= 400 && code != 408 && code != 429 && code != 503 &&
+                 code < 500)) {
+                x->failed = 1;
+                x->http_error = code;
+                x->relink_needed = 1;
+                snprintf(x->err, sizeof x->err, "HTTP %ld", code);
+                break;
+            }
+            if (sl->bad_resp && code == 200) { // server ignored byte range on a ranged segment
+                x->failed = 1;
+                snprintf(x->err, sizeof x->err, "%s", sl->err);
+                break;
+            }
+
+            // Transient / congestion / partial read
+            int in_grace = now < x->grace_until_ms && code < 400;
+            if (!in_grace && congested_error(code, rc)) aimd_shrink(x, in_flight, sl->resp_retry_after, now);
+
+            if (x->usb_mode) {
+                if (code == 429 || code == 503) {
+                    if (++sl->usb_busy_retries > 30) {
+                        x->failed = 1;
+                        x->http_error = code;
+                        snprintf(x->err, sizeof x->err, "HTTP %ld", code);
+                        break;
+                    }
+                    int wait_s = sl->resp_retry_after > 0 ? sl->resp_retry_after
+                                                          : (sl->usb_busy_retries * 2 < 15 ? sl->usb_busy_retries * 2 : 15);
+                    sl->usb_retry_at_ms = now + (int64_t)wait_s * 1000;
+                } else {
+                    if (got >= 65536 || in_grace) sl->usb_attempts = 0;
+                    else if (++sl->usb_attempts >= 5) {
+                        x->failed = 1;
+                        x->relink_needed = x->is_debrid;
+                        snprintf(x->err, sizeof x->err, "%s", sl->err[0] ? sl->err : curl_easy_strerror(rc));
+                        break;
+                    }
+                    sl->usb_retry_at_ms = now + (got >= 65536 ? 200 : 2000);
+                }
+                continue;
+            }
+
+            seg *sg = &x->segs[x->single ? 0 : sl->seg_idx];
+            if (!x->single) sg->owned = 0;
+            else x->segs[0].owned = 0;
+
+            if (code == 429 || code == 503) {
+                if (++sg->busy_retries > 30) {
+                    x->failed = 1;
+                    x->http_error = code;
+                    snprintf(x->err, sizeof x->err, "HTTP %ld", code);
+                    break;
+                }
+                int wait_s = sl->resp_retry_after > 0 ? sl->resp_retry_after
+                                                      : (sg->busy_retries * 2 < 15 ? sg->busy_retries * 2 : 15);
+                sg->retry_at_ms = now + (int64_t)wait_s * 1000;
+                sg->waiting = 1;
+            } else {
+                if (got >= 65536 || in_grace) sg->attempts = 0;
+                else if (++sg->attempts >= 5) {
+                    x->failed = 1;
+                    x->relink_needed = x->is_debrid;
+                    snprintf(x->err, sizeof x->err, "%s", sl->err[0] ? sl->err : curl_easy_strerror(rc));
+                    break;
+                }
+                sg->retry_at_ms = now + (got >= 65536 ? 200 : 2000);
+                sg->waiting = 1;
+            }
+        }
+        if (x->failed || j->stop || g_quit || writer_disk_error(x->w)) break;
+
+        // 7. Aggregate stall watchdog + periodic UI & log telemetry
+        now = plat_now_ms();
+        int64_t d_seen = xfer_done(x, 1);
+        if (d_seen - last_recv_done >= 65536) {
+            last_recv_done = d_seen;
+            x->last_progress_ms = now;
+        }
+        int paused_cnt = 0;
+        for (int i = 0; i < x->nslots; i++)
+            if (x->slots[i].active && x->slots[i].paused) paused_cnt++;
+
+        if (now < x->win_paused_until_ms || paused_cnt > 0) x->last_progress_ms = now;
+        if (now - x->last_progress_ms >= x->stall_ms) {
+            x->failed = 1;
+            x->relink_needed = 1;
+            snprintf(x->err, sizeof x->err, "stalled (no progress for %llds)", (long long)(x->stall_ms / 1000));
             break;
         }
-        started++;
-    }
-    pthread_mutex_lock(&g_lock);
-    j->conns = started;
-    pthread_mutex_unlock(&g_lock);
 
-    int64_t last_ms = plat_now_ms(), last_done = j->done, last_save = last_ms;
-    double speed = 0;
-    pthread_mutex_lock(&x->lock);
-    while (x->live > 0) {
-        pthread_mutex_unlock(&x->lock);
-        plat_sleep_ms(500);
-        int64_t now = plat_now_ms(), d = xfer_done(x, single, 1, total);
-        if (now - last_ms >= 1000) {
-            double inst = (double)(d - last_done) * 1000.0 / (double)(now - last_ms);
-            speed = speed == 0 ? inst : speed * 0.6 + inst * 0.4;
-            last_ms = now, last_done = d;
-        }
-        if (!single && now - last_save >= 5000) save_state(x, total), last_save = now;
-        int active = 0, waiting = 0, n = __atomic_load_n(&x->nseg, __ATOMIC_ACQUIRE);
-        for (int i = 0; i < n; i++) {
-            active += now - x->segs[i].last_data_ms < 3000;
-            waiting += x->segs[i].waiting;
-        }
-        pthread_mutex_lock(&x->lock);
-        int live = x->live;
-        pthread_mutex_unlock(&x->lock);
-        pthread_mutex_lock(&g_lock);
-        j->conns = live;
-        j->done = d, j->speed = speed, j->active = active, j->waiting = waiting, j->last_code = x->last_code;
-        pthread_mutex_unlock(&g_lock);
-        pthread_mutex_lock(&x->lock);
-    }
-    pthread_mutex_unlock(&x->lock);
+        if (now - last_ui_ms >= 500) {
+            int64_t dt_ms = now - last_ui_ms;
+            double inst = (double)(d_seen - ui_recv) * 1000.0 / (double)dt_ms;
+            recv_speed = recv_speed == 0 ? inst : recv_speed * 0.6 + inst * 0.4;
+            ui_recv = d_seen;
+            last_ui_ms = now;
 
-    int64_t d = xfer_done(x, single, 0, total);
-    int complete = !x->failed && !j->stop && !g_quit && !x->disk_error && (total < 0 || d >= total);
-    if (fsync(x->fd)) { /* best effort */ }
+            int64_t w_written = 0;
+            size_t w_buf = 0;
+            unsigned w_max = 0;
+            writer_stats(x->w, &w_written, &w_buf, &w_max, NULL);
+
+            int active_cnt = 0, waiting_cnt = 0;
+            for (int i = 0; i < x->nslots; i++) {
+                if (x->slots[i].active && !x->slots[i].paused) {
+                    int64_t lms = x->usb_mode || x->single ? x->segs[0].last_data_ms
+                                                           : x->segs[x->slots[i].seg_idx].last_data_ms;
+                    if (now - lms < 3000) active_cnt++;
+                }
+            }
+            if (!x->usb_mode) {
+                for (int i = 0; i < x->nseg; i++) waiting_cnt += x->segs[i].waiting;
+            }
+            if (now < x->win_paused_until_ms) waiting_cnt += x->win_allowed - in_flight;
+
+            int64_t disk_dt = now - last_log_ms;
+            if (disk_dt >= 5000) {
+                int64_t d_disk = xfer_done(x, 0);
+                double r_mb = (double)(d_seen - log_recv) * 1000.0 / (double)disk_dt / 1048576.0;
+                double d_mb = (double)(d_disk - log_disk) * 1000.0 / (double)disk_dt / 1048576.0;
+                disk_speed = d_mb * 1048576.0;
+                double busy_pct = (double)multi_busy_us / ((double)disk_dt * 10.0);
+                plat_log("job %d: conns=%d/%d win=%d paused=%d recv=%.1fMB/s disk=%.1fMB/s buf=%zuKiB wmax=%ums "
+                         "busy=%.0f%% rcvbuf=%dKiB http=%s host=%s%s",
+                         j->id, active_cnt, in_flight, x->win_allowed, paused_cnt, r_mb, d_mb, w_buf / 1024, w_max,
+                         busy_pct, x->rcvbuf / 1024, x->http_ver[0] ? x->http_ver : "?",
+                         x->cdn[0] ? x->cdn : "-", x->usb_mode ? " usb=seq" : "");
+                log_recv = d_seen;
+                log_disk = d_disk;
+                multi_busy_us = 0;
+                last_log_ms = now;
+            }
+
+            pthread_mutex_lock(&g_lock);
+            j->conns = in_flight;
+            j->active = active_cnt;
+            j->waiting = waiting_cnt;
+            j->paused_conns = paused_cnt;
+            j->win = x->win_allowed;
+            j->done = d_seen;
+            j->speed = recv_speed;
+            j->disk_speed = disk_speed > 0 ? disk_speed : recv_speed;
+            j->buffered = w_buf;
+            if (w_max > j->write_max_ms) j->write_max_ms = w_max;
+            j->rcvbuf = x->rcvbuf;
+            j->last_code = x->last_code;
+            snprintf(j->http_ver, sizeof j->http_ver, "%s", x->http_ver);
+            pthread_mutex_unlock(&g_lock);
+        }
+
+        // 8. Wait for socket readiness, Retry-After wake, or writer wakeup
+        int wait_ms = 100;
+        if (in_flight == 0 && !all_done) wait_ms = 200;
+        curl_multi_poll(x->multi, NULL, 0, wait_ms, NULL);
+    }
+
+    // Drain/cleanup all active easy handles and flush any partial blocks before closing writer
+    for (int i = 0; i < x->nslots; i++) {
+        slot *sl = &x->slots[i];
+        if (sl->active) {
+            curl_multi_remove_handle(x->multi, sl->h);
+            sl->active = 0;
+        }
+        if (!x->usb_mode) flush_slot_block(x, sl);
+    }
+    // If USB mode had any completed leading chunks waiting to drain on normal completion, drain them now
+    if (x->usb_mode && !x->failed && !j->stop && !g_quit && !writer_disk_error(x->w)) {
+        int progressed = 1;
+        while (progressed) {
+            progressed = 0;
+            for (int i = 0; i < x->nslots; i++) {
+                slot *sl = &x->slots[i];
+                if (!sl->usb_assigned || !sl->usb_ready || sl->chunk_start != x->usb_cursor) continue;
+                while (sl->win_drained < sl->win_used) {
+                    wblock *b = writer_take(x->w);
+                    if (!b) {
+                        plat_sleep_ms(10);
+                        continue;
+                    }
+                    size_t take = sl->win_used - sl->win_drained;
+                    if (take > WBLOCK_SIZE) take = WBLOCK_SIZE;
+                    memcpy(b->data, sl->win_buf + sl->win_drained, take);
+                    writer_enqueue(x->w, b, 0, x->usb_cursor, take);
+                    sl->win_drained += take;
+                    x->usb_cursor += (int64_t)take;
+                }
+                sl->usb_ready = sl->usb_assigned = 0;
+                progressed = 1;
+            }
+        }
+    }
+
+    int w_err = writer_finish(x->w, 1);
+    x->w = NULL;
+
+    for (int i = 0; i < x->nslots; i++) {
+        if (x->slots[i].hdrs) curl_slist_free_all(x->slots[i].hdrs);
+        if (x->slots[i].h) curl_easy_cleanup(x->slots[i].h);
+        free(x->slots[i].win_buf);
+    }
+    curl_multi_cleanup(x->multi);
+
+    int64_t d = xfer_done(x, 0);
+    int complete = !x->failed && !j->stop && !g_quit && !w_err && (total < 0 || d >= total);
     close(x->fd);
+
     pthread_mutex_lock(&g_lock);
-    j->done = d, j->speed = 0, j->conns = j->active = j->waiting = 0;
+    j->done = d;
+    j->speed = j->disk_speed = 0;
+    j->buffered = 0;
+    j->conns = j->active = j->waiting = j->paused_conns = 0;
     if (single && total < 0) j->total = d;
     pthread_mutex_unlock(&g_lock);
+
     int result;
     if (complete) {
         if (!single) {
@@ -667,19 +1462,18 @@ static int transfer(job *j, const char *url, char *err, size_t errlen) {
     } else {
         if (!single) save_state(x, total);
         if (j->stop || g_quit) result = T_STOPPED;
-        else if (x->disk_error) {
-            snprintf(err, errlen, "write failed: %s", strerror(x->disk_error));
+        else if (w_err) {
+            snprintf(err, errlen, "write failed: %s", strerror(w_err));
             result = T_FATAL;
-        } else if (x->http_error) {
-            snprintf(err, errlen, "%s", x->err);
+        } else if (x->relink_needed || x->http_error) {
+            snprintf(err, errlen, "%s", x->err[0] ? x->err : "transfer failed");
             result = T_RELINK;
         } else {
             snprintf(err, errlen, "%s", x->err[0] ? x->err : "transfer incomplete");
             result = T_RETRY;
         }
     }
-    pthread_mutex_destroy(&x->lock);
-    pthread_cond_destroy(&x->cv);
+    pthread_mutex_destroy(&x->state_lock);
     free(x);
     return result;
 }
@@ -693,8 +1487,6 @@ static void set_state(job *j, int st, const char *err) {
     pthread_mutex_unlock(&g_lock);
 }
 
-// Real-Debrid: the direct link for a hoster link. Uses the last one while it works; a new one is asked for after any
-// failure (direct links expire, also across restarts). Also names the job from Real-Debrid when it has no name yet.
 static int rd_resolve(job *j, char *url, size_t urllen, char *err, size_t errlen, int *permanent) {
     *permanent = 0;
     if (j->direct) {
@@ -730,7 +1522,8 @@ static void run_job(job *j) {
     char err[300] = "", url[4096];
     char dir[1800];
     int is_rd = !strcmp(j->kind, "rd"), permanent = 0;
-    for (int i = 0; is_rd && !j->name[0] && i < 3; i++) { // the file name comes from Real-Debrid
+    int is_tb = !strcmp(j->kind, "torrents") || !strcmp(j->kind, "webdl") || !strcmp(j->kind, "usenet");
+    for (int i = 0; is_rd && !j->name[0] && i < 3; i++) {
         if (i) plat_sleep_ms(3000);
         if (!rd_resolve(j, url, sizeof url, err, sizeof err, &permanent)) break;
         if (permanent || i == 2 || j->stop || g_quit) {
@@ -757,8 +1550,9 @@ static void run_job(job *j) {
     }
     plat_log("job %d: start %s", j->id, j->path);
     j->started_ms = plat_now_ms();
+    int tb_relinks = 0;
     for (int attempt = 0; attempt < 6; attempt++) {
-        if (attempt) plat_sleep_ms(attempt < 3 ? 3000 : 10000);
+        if (attempt) plat_sleep_ms(attempt < 3 ? 2000 : 8000);
         if (j->stop || g_quit) break;
         if (!strcmp(j->kind, "url")) snprintf(url, sizeof url, "%s", j->url ? j->url : "");
         else if (is_rd) {
@@ -794,10 +1588,22 @@ static void run_job(job *j) {
             set_state(j, J_DONE, "");
             return;
         }
+        if (is_tb && r == T_RELINK) {
+            tb_relinks++;
+            plat_log("job %d: TorBox CDN failed (%s); link rotation %d/3", j->id, err, tb_relinks);
+            if (tb_relinks >= 3) {
+                char msg[300];
+                snprintf(msg, sizeof msg, "%s (try switching CDN in TorBox settings)", err);
+                pthread_mutex_lock(&g_lock);
+                snprintf(j->err, sizeof j->err, "%s", msg);
+                pthread_mutex_unlock(&g_lock);
+                break;
+            }
+        }
         pthread_mutex_lock(&g_lock);
         snprintf(j->err, sizeof j->err, "%s", err);
         pthread_mutex_unlock(&g_lock);
-        if (is_rd && r != T_STOPPED) forget_direct(j); // maybe expired: unrestrict again next time
+        if (is_rd && r != T_STOPPED) forget_direct(j);
         if (r == T_STOPPED || r == T_FATAL) break;
         plat_log("job %d: attempt %d failed: %s", j->id, attempt + 1, err);
     }
@@ -809,7 +1615,7 @@ static void run_job(job *j) {
         unlink(p);
         set_state(j, J_CANCELLED, "");
     } else if (j->stop == 1) set_state(j, J_PAUSED, "");
-    else if (g_quit) set_state(j, J_QUEUED, ""); // resumes on the next start
+    else if (g_quit) set_state(j, J_QUEUED, "");
     else {
         plat_log("job %d: failed: %s", j->id, j->err);
         set_state(j, J_FAILED, NULL);
@@ -871,7 +1677,7 @@ int dl_add(const char *kind, long long item_id, long long file_id, const char *u
     }
     char clean_name[256], clean_sub[512];
     snprintf(clean_name, sizeof clean_name, "%s", name && *name ? name : is_rd ? "" : "download");
-    if (is_url && !is_rd && (!name || !*name)) { // name from the URL path
+    if (is_url && !is_rd && (!name || !*name)) {
         const char *q = strchr(url + 8, '/');
         const char *end = q ? q + strcspn(q, "?#") : NULL;
         const char *s = end ? end : NULL;
@@ -884,12 +1690,12 @@ int dl_add(const char *kind, long long item_id, long long file_id, const char *u
         }
     }
     sanitize_name(clean_name);
-    if (!clean_name[0] && !is_rd) snprintf(clean_name, sizeof clean_name, "download"); // rd: named when it starts
+    if (!clean_name[0] && !is_rd) snprintf(clean_name, sizeof clean_name, "download");
     if (sanitize_relpath(subdir ? subdir : "", clean_sub, sizeof clean_sub)) {
         snprintf(err, errlen, "subfolder too long");
         return -1;
     }
-    static job tmp; // only used under g_lock
+    static job tmp;
     pthread_mutex_lock(&g_lock);
     snprintf(tmp.folder, sizeof tmp.folder, "%s", folder);
     size_t tl = strlen(tmp.folder);
@@ -897,7 +1703,7 @@ int dl_add(const char *kind, long long item_id, long long file_id, const char *u
     snprintf(tmp.subdir, sizeof tmp.subdir, "%s", clean_sub);
     snprintf(tmp.name, sizeof tmp.name, "%s", clean_name);
     build_path(&tmp);
-    for (int i = 0; i < g_njobs; i++) { // the same target twice would fight over one .part file
+    for (int i = 0; i < g_njobs; i++) {
         job *o = g_jobs[i];
         if ((o->state == J_DONE || o->state == J_CANCELLED) || !tmp.name[0] || strcmp(o->path, tmp.path)) continue;
         pthread_mutex_unlock(&g_lock);
@@ -985,7 +1791,7 @@ int dl_remove(int id) {
         job *j = g_jobs[i];
         if (j->id != id) continue;
         if (j->state == J_STARTING || j->state == J_RUNNING) break;
-        if (j->state == J_FAILED || j->state == J_PAUSED || j->state == J_QUEUED) { // forget the partial file too
+        if (j->state == J_FAILED || j->state == J_PAUSED || j->state == J_QUEUED) {
             char p[1900];
             snprintf(p, sizeof p, "%s.part", j->path);
             unlink(p);
@@ -1020,7 +1826,7 @@ int dl_active_count(void) {
 void dl_settings(int parallel, int connections) {
     pthread_mutex_lock(&g_lock);
     if (parallel >= 1 && parallel <= 3) g_parallel = parallel;
-    if (connections >= 1 && connections <= MAX_CONNS) g_connections = connections;
+    if (connections >= 0 && connections <= MAX_CONNS) g_connections = connections;
     save_settings_locked();
     pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_lock);
@@ -1033,9 +1839,16 @@ void dl_jobs_json(sbuf *o) {
         job *j = g_jobs[i];
         if (i) sb_puts(o, ",");
         sb_printf(o, "{\"id\":%d,\"kind\":\"%s\",\"state\":\"%s\",\"total\":%lld,\"done\":%lld,\"speed\":%.0f,"
-                     "\"conns\":%d,\"active\":%d,\"waiting\":%d,\"http\":%ld,\"name\":",
-                  j->id, j->kind, state_names[j->state], (long long)j->total, (long long)j->done, j->speed, j->conns,
-                  j->active, j->waiting, j->last_code);
+                     "\"disk_speed\":%.0f,\"buffered\":%zu,\"write_max_ms\":%u,\"paused_conns\":%d,"
+                     "\"conns\":%d,\"win\":%d,\"active\":%d,\"waiting\":%d,\"rcvbuf\":%d,\"usb_mode\":%s,"
+                     "\"http\":%ld,\"http_ver\":",
+                  j->id, j->kind, state_names[j->state], (long long)j->total, (long long)j->done, j->speed,
+                  j->disk_speed, j->buffered, j->write_max_ms, j->paused_conns, j->conns, j->win, j->active,
+                  j->waiting, j->rcvbuf, j->usb_mode ? "true" : "false", j->last_code);
+        sb_json_str(o, j->http_ver);
+        sb_puts(o, ",\"cdn\":");
+        sb_json_str(o, j->cdn);
+        sb_puts(o, ",\"name\":");
         char shown[800];
         snprintf(shown, sizeof shown, "%s%s%s", j->subdir, j->subdir[0] ? "/" : "",
                  j->name[0] ? j->name : "(name comes from Real-Debrid)");
@@ -1057,7 +1870,7 @@ void dl_shutdown(void) {
     g_quit = 1;
     pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_lock);
-    for (int i = 0; i < 100 && g_running; i++) plat_sleep_ms(100); // the jobs save their state
+    for (int i = 0; i < 100 && g_running; i++) plat_sleep_ms(100);
     pthread_mutex_lock(&g_lock);
     save_queue_locked();
     pthread_mutex_unlock(&g_lock);

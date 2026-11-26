@@ -9,7 +9,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/torbox-test.XXXXXX")
 mport=18765 port=18080
 base=http://127.0.0.1:$port
 pids=()
-cleanup() { for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; }
+cleanup() { for p in ${pids[@]+"${pids[@]}"}; do kill "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; }
 trap cleanup EXIT
 
 python3 -I "$here/tests/mock_torbox.py" $mport > "$work/mock.log" 2>&1 &
@@ -17,7 +17,7 @@ pids+=($!)
 for _ in $(seq 50); do curl -s -o /dev/null http://127.0.0.1:$mport/ && break; sleep 0.1; done
 start_app() {
     TORBOX_API_BASE=http://127.0.0.1:$mport/v1/api RD_API_BASE=http://127.0.0.1:$mport/rest/1.0 TORBOX_APP_DIR=$work/app TORBOX_DOWNLOADS=$work/dl \
-        TORBOX_ROOTS=$work TORBOX_PORT=$port "$bin" >> "$work/app.log" 2>&1 &
+        TORBOX_ROOTS=$work TORBOX_PORT=$port TORBOX_LOW_SPEED_TIME=2 TORBOX_STALL_MS=4000 ${1+"$@"} "$bin" >> "$work/app.log" 2>&1 &
     app_pid=$!
     pids+=($app_pid)
     for _ in $(seq 50); do curl -s "$base/api/status" > /dev/null && return; sleep 0.1; done
@@ -33,6 +33,10 @@ check() { # name, condition-command...
 get() { curl -s "$base/api/$1"; }
 post() { local p=$1; shift; curl -s -H 'X-TorBox-PS5: 1' "$@" "$base/api/$p"; }
 jq_() { python3 -I -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
+file_mode() {
+    if [[ $(uname -s) == Darwin ]]; then stat -f %Lp "$1"; else stat -c %a "$1"; fi
+}
+export -f file_mode
 
 check "UI page served" bash -c "curl -s $base/ | grep -q 'TorBox'"
 check "app.js served" bash -c "curl -s $base/app.js | grep -q loadStatus"
@@ -43,7 +47,7 @@ check "wrong key refused" bash -c "grep -q 'invalid' <<<'$r'"
 check "wrong key not stored" test ! -e "$work/app/torbox-key.txt"
 r=$(post login --data-urlencode "key= test-key-0000 ")
 check "right key accepted" bash -c "grep -q '\"torbox\":{[^}]*\"logged_in\":true' <<<'$r' && grep -q tester@example.com <<<'$r'"
-check "key stored with mode 600" bash -c "[[ \$(stat -c %a $work/app/torbox-key.txt) == 600 ]]"
+check "key stored with mode 600" bash -c "[[ \$(file_mode $work/app/torbox-key.txt) == 600 ]]"
 check "key never in status" bash -c "! curl -s $base/api/status | grep -q test-key-0000"
 check "torrent list proxied" bash -c "curl -s '$base/api/list?kind=torrents&fresh=1' | grep -q 'Big Buck Bunny'"
 check "usenet list (empty)" bash -c "curl -s '$base/api/list?kind=usenet' | grep -q '\"data\": \[\]'"
@@ -58,11 +62,11 @@ post settings -d connections=6 -d parallel=2 > /dev/null
 # Whole torrent (2 files, with folder structure), multi-connection.
 post download -d kind=torrents -d id=101 -d file_id=0 --data-urlencode "folder=$work/dl/a" \
     --data-urlencode "subdir=Big Buck Bunny (test)" -d name=movie.mkv > /dev/null
+r=$(post download -d kind=torrents -d id=101 -d file_id=0 --data-urlencode "folder=$work/dl/a" \
+    --data-urlencode "subdir=Big Buck Bunny (test)" -d name=movie.mkv)
+check "duplicate refused" bash -c "grep -q 'already in the queue' <<<'$r'"
 post download -d kind=torrents -d id=101 -d file_id=1 --data-urlencode "folder=$work/dl/a" \
     --data-urlencode "subdir=Big Buck Bunny (test)/extras" -d name=poster.jpg > /dev/null
-r=$(post download -d kind=torrents -d id=101 -d file_id=1 --data-urlencode "folder=$work/dl/a" \
-    --data-urlencode "subdir=Big Buck Bunny (test)/extras" -d name=poster.jpg)
-check "duplicate refused" bash -c "grep -q 'already in the queue' <<<'$r'"
 # Web download whose server drops every connection after 7 MiB.
 post download -d kind=webdl -d id=201 -d file_id=5 --data-urlencode "folder=$work/dl/b" -d name=flaky.bin > /dev/null
 # Direct link without Range support (single stream).
@@ -147,7 +151,7 @@ check "RD: bad token refused, readable" bash -c "grep -q 'bad or expired API tok
 r=$(post login -d provider=realdebrid --data-urlencode key=rd-test-token)
 check "RD: token accepted, user shown" bash -c "grep -q '\"realdebrid\":{[^}]*\"logged_in\":true' <<<'$r' && grep -q rdtester <<<'$r' && grep -q premium <<<'$r'"
 check "RD: TorBox still logged in" bash -c "grep -q '\"torbox\":{[^}]*\"logged_in\":true' <<<'$r'"
-check "RD: token stored separately (600)" bash -c "[[ \$(stat -c %a $work/app/realdebrid-token.txt) == 600 ]] && test -e $work/app/torbox-key.txt"
+check "RD: token stored separately (600)" bash -c "[[ \$(file_mode $work/app/realdebrid-token.txt) == 600 ]] && test -e $work/app/torbox-key.txt"
 check "RD: token never in status" bash -c "! curl -s $base/api/status | grep -q rd-test-token"
 r=$(rdq "torrents?page=1&limit=2")
 check "RD: paged torrents (page 1 of 5)" bash -c "python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d[\"total\"]==5 and len(d[\"data\"])==2 and d[\"data\"][0][\"id\"]==\"RDT1\"' '$r'"
@@ -215,6 +219,33 @@ post download -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/50
     --data-urlencode "folder=$work/dl/c" -d name=norange.bin > /dev/null
 wait_jobs 10 || true
 check "existing file kept" bash -c "curl -s $base/api/jobs | grep -q 'already there'"
+
+# Auto connections (0), Retry-After + ETag validation, and TorBox stalled CDN link rotation.
+r=$(post settings -d connections=0 -d parallel=2)
+check "Auto connections (0) accepted" bash -c "grep -q '\"connections\":0' <<<'$r'"
+post download -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((24 * 1048576))?maxconn=2&retry_after=1&etag=v1" \
+    --data-urlencode "folder=$work/dl/h" -d name=retry-after.bin > /dev/null
+post download -d kind=torrents -d id=103 -d file_id=0 --data-urlencode "folder=$work/dl/h" -d name=stalled-cdn.bin > /dev/null
+check "Auto / Retry-After / TorBox CDN rotation finish" wait_jobs 60
+check "retry-after.bin content" verify "$work/dl/h/retry-after.bin" $((24 * 1048576))
+check "stalled-cdn.bin content" verify "$work/dl/h/stalled-cdn.bin" $((20 * 1048576))
+tb_calls=$(curl -s "http://127.0.0.1:$mport/control/stats" | jq_ 'd["tb_requestdl"]["103"]')
+check "TorBox rotated stalled CDN link ($tb_calls calls)" test "$tb_calls" -ge 2
+
+# Check /api/log returns telemetry and never leaks credentials or RD direct paths.
+check "log endpoint works" bash -c "curl -s '$base/api/log' | grep -q 'rcvbuf='"
+check "log has no secrets" bash -c "! curl -s '$base/api/log' | grep -qE 'test-key-0000|rd-test-token|rdfile'"
+
+# USB sequential sliding-window mode + async writer latency decoupling test.
+kill "$app_pid"; wait "$app_pid" 2>/dev/null || true
+start_app env TORBOX_FORCE_USB_MODE=1 TORBOX_TEST_REJECT_GAPS=1 TORBOX_TEST_WRITE_DELAY_MS=5
+post settings -d connections=8 > /dev/null
+post download -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((32 * 1048576))" \
+    --data-urlencode "folder=$work/dl/usb" -d name=usb-seq.bin > /dev/null
+check "USB sequential download finishes with reject_gaps + write delay" wait_jobs 60
+check "usb-seq.bin content" verify "$work/dl/usb/usb-seq.bin" $((32 * 1048576))
+check "USB sequential telemetry logged" bash -c "curl -s $base/api/log | grep -q 'usb=seq'"
+
 check "logout removes key" bash -c "curl -s -H 'X-TorBox-PS5: 1' -X POST $base/api/logout | grep -q ok && test ! -e $work/app/torbox-key.txt"
 check "list after logout refused" bash -c "curl -s '$base/api/list?kind=torrents' | grep -q 'not logged in'"
 check "key not in log" bash -c "! grep -rq test-key-0000 $work/app/log.txt $work/app.log"

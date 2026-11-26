@@ -14,8 +14,23 @@
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 deps=${PS5_DEPS:-$(cd -- "$here/.." && pwd)/deps}
-sdk=${PS5_PAYLOAD_SDK:-$deps/ps5-sdk-full}
-ca=${CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}
+overdrive_deps=$(cd -- "$here/.." && pwd)/overdrive-tb-3rd-user/ps5-react/.deps
+if [[ -n ${PS5_PAYLOAD_SDK:-} ]]; then
+    sdk=$PS5_PAYLOAD_SDK
+elif [[ -d $here/ps5-payload-sdk ]]; then
+    sdk=$here/ps5-payload-sdk
+elif [[ -d $deps/ps5-sdk-full ]]; then
+    sdk=$deps/ps5-sdk-full
+else
+    sdk=$overdrive_deps/sdk/ps5-payload-sdk
+fi
+if [[ -n ${CA_BUNDLE:-} ]]; then
+    ca=$CA_BUNDLE
+elif [[ -f /etc/ssl/certs/ca-certificates.crt ]]; then
+    ca=/etc/ssl/certs/ca-certificates.crt
+else
+    ca=/etc/ssl/cert.pem
+fi
 out=$here/build
 version=$(sed -n 's/^#define APP_VERSION "\(.*\)"/\1/p' "$here/src/app.h")
 srcs=("$here"/src/*.c)
@@ -28,21 +43,38 @@ gen_assets() {
 
 build_host() {
     gen_assets
-    local curl=${HOST_CURL:-/home/linuxbrew/.linuxbrew/opt/curl}
+    local curl=${HOST_CURL:-}
+    if [[ -z $curl ]]; then
+        for candidate in /home/linuxbrew/.linuxbrew/opt/curl /opt/homebrew/opt/curl /usr/local/opt/curl; do
+            if [[ -d $candidate ]]; then curl=$candidate; break; fi
+        done
+    fi
+    local cflags=() ldflags=(-lcurl -lpthread)
+    if [[ -n $curl && -d $curl ]]; then
+        cflags+=(-I"$curl/include")
+        ldflags=(-L"$curl/lib" -Wl,-rpath,"$curl/lib" -lcurl -lpthread)
+    fi
     mkdir -p "$out/host"
-    cc -O2 -g "${warn[@]}" -I"$here/src" -I"$curl/include" "${srcs[@]}" "$out/gen/assets.c" \
-        -L"$curl/lib" -Wl,-rpath,"$curl/lib" -lcurl -lpthread -o "$out/host/torbox-ps5"
+    cc -O2 -g "${warn[@]}" -I"$here/src" "${cflags[@]}" "${srcs[@]}" "$out/gen/assets.c" \
+        "${ldflags[@]}" -o "$out/host/torbox-ps5"
     echo "host: $out/host/torbox-ps5"
 }
 
 build_payload() {
     gen_assets
-    local hb=$sdk/target/user/homebrew
-    PS5_PAYLOAD_SDK=$sdk "$sdk/bin/prospero-clang" -O2 "${warn[@]}" -DCURL_STATICLIB -I"$here/src" -I"$hb/include" \
+    local hb=${PS5_HOMEBREW:-$sdk/target/user/homebrew}
+    if [[ ! -f $hb/lib/libcurl.a && -f $overdrive_deps/network-ports/v0.40.2/lib/libcurl.a ]]; then
+        hb=$overdrive_deps/network-ports/v0.40.2
+    fi
+    local ppath=$PATH
+    for llvm in /opt/homebrew/opt/llvm@18/bin /usr/local/opt/llvm@18/bin; do
+        if [[ -d $llvm ]]; then ppath="$llvm:$ppath"; break; fi
+    done
+    PATH=$ppath PS5_PAYLOAD_SDK=$sdk "$sdk/bin/prospero-clang" -O2 "${warn[@]}" -DCURL_STATICLIB -I"$here/src" -I"$hb/include" \
         "${srcs[@]}" "$out/gen/assets.c" -L"$hb/lib" -lcurl -lpsl -lssl -lcrypto -lzstd -lz -lpthread \
         -o "$out/torbox-ps5.elf"
-    "$sdk/bin/llvm-strip" --strip-debug "$out/torbox-ps5.elf" 2>/dev/null || true
-    echo "payload: $out/torbox-ps5.elf ($(stat -c %s "$out/torbox-ps5.elf") bytes)"
+    PATH=$ppath "$sdk/bin/llvm-strip" --strip-debug "$out/torbox-ps5.elf" 2>/dev/null || true
+    echo "payload: $out/torbox-ps5.elf ($(wc -c < "$out/torbox-ps5.elf" | tr -d ' ') bytes)"
 }
 
 build_title() {

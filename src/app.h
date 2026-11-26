@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define APP_VERSION "1.0.0"
+#define APP_VERSION "1.1.0"
 #define APP_TITLE_ID "PPSA97630"
 #define APP_PORT 8080
 #define THREAD_STACK (1024 * 1024) // below 2 MiB: titles take bigger stacks from the small flexible pool
@@ -19,7 +19,9 @@ int plat_path_allowed(const char *path); // may the web UI browse/write this pat
 void plat_local_ip(char *out, size_t len);
 int plat_start_thread(void *(*fn)(void *), void *arg); // detached, THREAD_STACK
 int64_t plat_now_ms(void);
+int64_t plat_now_us(void);
 void plat_sleep_ms(int ms);
+int plat_is_usb_path(const char *path);
 
 // ---- small string buffer (util.c) ----
 typedef struct {
@@ -60,7 +62,13 @@ const char *cred_path(int prov);
 int cred_get(int prov, char *out, size_t len); // 0 = stored key copied out
 int cred_set(int prov, const char *key);
 void cred_clear(int prov);
+typedef struct {
+    int before, after, err;
+} net_sock_info;
 void net_apply(void *curl_handle); // CA bundle, socket tuning and common options for every curl handle
+void net_apply_dl(void *curl_handle, net_sock_info *si); // download-tuned options (HTTP/1.1, identity, keepalive, SO_RCVBUF)
+int net_is_debrid_cdn(const char *url);
+void net_host_of(const char *url, char *out, size_t len);
 // method "GET" or "POST" (form = x-www-form-urlencoded body); bearer may be NULL; total gets X-Total-Count (or -1).
 // Returns the HTTP status, 0 on a transport error (err set).
 int net_request(const char *method, const char *url, const char *bearer, const char *form, sbuf *body,
@@ -86,6 +94,29 @@ int rd_info(const char *id, sbuf *out, char *err, size_t errlen);
 // Hoster link -> direct download URL (+ file name, max chunks). *permanent: retrying will not help.
 int rd_unrestrict(const char *link, char *url, size_t urllen, char *name, size_t namelen, int *chunks, int *permanent,
                   char *err, size_t errlen);
+
+// ---- async disk writer (writer.c) ----
+#define WBLOCK_SIZE (128 * 1024)
+#define WPOOL_MAX 128
+#define WPOOL_COMPACT 64
+
+typedef struct wblock {
+    char *data;
+} wblock;
+
+typedef struct writer writer;
+typedef void (*writer_commit_fn)(void *ctx, int seg_idx, int64_t new_pos);
+typedef void (*writer_state_fn)(void *ctx);
+
+writer *writer_start(int fd, int pool_blocks, void *wakeup_multi, writer_commit_fn on_commit, writer_state_fn on_state,
+                     void *cb_ctx);
+wblock *writer_take(writer *w);
+void writer_release(writer *w, wblock *b);
+void writer_enqueue(writer *w, wblock *b, int seg_idx, int64_t offset, size_t len);
+int writer_has_free(writer *w);
+int writer_disk_error(writer *w);
+void writer_stats(writer *w, int64_t *written, size_t *buffered, unsigned *write_max_ms, uint64_t *write_calls);
+int writer_finish(writer *w, int do_fsync);
 
 // ---- downloads (dl.c) ----
 void dl_init(int workers);

@@ -3,6 +3,8 @@
 #include "app.h"
 
 #include <curl/curl.h>
+#include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -71,18 +73,40 @@ void cred_clear(int p) {
 // ---------- HTTPS ----------
 
 // The console gives sockets a 64 KiB receive buffer, which caps one connection at window / RTT (about 1.2 MB/s at
-// 60 ms). 512 KiB, the most it grants, measured 7.9 MB/s on one connection. Set before connect() so the TCP
-// handshake announces the bigger window.
+// 60 ms). Probe descending sizes without shrinking the system default, and record what the kernel granted.
 static int big_rcvbuf(void *ud, curl_socket_t fd, curlsocktype purpose) {
-    (void)ud;
     if (purpose != CURLSOCKTYPE_IPCXN) return CURL_SOCKOPT_OK;
-    int sizes[] = {4 << 20, 1 << 20, 512 << 10, 256 << 10};
+    net_sock_info *si = ud;
+    int before = 0, after = 0, last_err = 0;
+    socklen_t l = sizeof before;
+    if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &before, &l)) {
+        last_err = errno;
+        before = 0;
+    }
+    after = before;
+    static const int sizes[] = {2 << 20, 1536 << 10, 1 << 20, 896 << 10, 768 << 10, 512 << 10, 384 << 10, 256 << 10};
     for (unsigned i = 0; i < sizeof sizes / sizeof *sizes; i++) {
+        if (sizes[i] <= before) break;
         int got = 0;
-        socklen_t l = sizeof got;
-        if (!setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sizes[i], sizeof sizes[i]) &&
-            !getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &got, &l) && got >= (256 << 10))
+        l = sizeof got;
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sizes[i], sizeof sizes[i])) {
+            last_err = errno;
+            continue;
+        }
+        if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &got, &l)) {
+            last_err = errno;
+            continue;
+        }
+        after = got;
+        if (got > before || got >= sizes[i] / 2) {
+            last_err = 0;
             break;
+        }
+    }
+    if (si) {
+        si->before = before;
+        si->after = after;
+        si->err = last_err;
     }
     return CURL_SOCKOPT_OK;
 }
@@ -95,9 +119,64 @@ void net_apply(void *h) {
     curl_easy_setopt(c, CURLOPT_USERAGENT, "torbox-ps5/" APP_VERSION);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 20L);
     curl_easy_setopt(c, CURLOPT_SOCKOPTFUNCTION, big_rcvbuf);
+    curl_easy_setopt(c, CURLOPT_SOCKOPTDATA, NULL);
 #ifdef __PROSPERO__
     curl_easy_setopt(c, CURLOPT_IPRESOLVE, (long)CURL_IPRESOLVE_V4);
 #endif
+}
+
+void net_apply_dl(void *h, net_sock_info *si) {
+    CURL *c = h;
+    net_apply(c);
+    curl_easy_setopt(c, CURLOPT_SOCKOPTDATA, si);
+    curl_easy_setopt(c, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1);
+    curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "identity");
+    curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(c, CURLOPT_BUFFERSIZE, 128L * 1024);
+}
+
+void net_host_of(const char *url, char *out, size_t len) {
+    if (!len) return;
+    out[0] = 0;
+    if (!url) return;
+    const char *s = strstr(url, "://");
+    s = s ? s + 3 : url;
+    const char *end = s + strcspn(s, "/?#");
+    const char *at = memchr(s, '@', (size_t)(end - s));
+    if (at) s = at + 1;
+    if (*s == '[') {
+        const char *rb = memchr(s, ']', (size_t)(end - s));
+        if (rb) end = rb + 1;
+    } else {
+        const char *colon = memchr(s, ':', (size_t)(end - s));
+        if (colon) end = colon;
+    }
+    size_t n = (size_t)(end - s);
+    if (n >= len) n = len - 1;
+    for (size_t i = 0; i < n; i++) out[i] = (char)tolower((unsigned char)s[i]);
+    out[n] = 0;
+}
+
+static int host_has_suffix(const char *host, const char *domain) {
+    size_t hl = strlen(host), dl = strlen(domain);
+    if (hl == dl) return !strcmp(host, domain);
+    return hl > dl && host[hl - dl - 1] == '.' && !strcmp(host + hl - dl, domain);
+}
+
+int net_is_debrid_cdn(const char *url) {
+    char host[256];
+    net_host_of(url, host, sizeof host);
+    if (!host[0]) return 0;
+    static const char *const domains[] = {
+        "tb-cdn.pw", "tb-cdn.to", "tb-cdn.earth", "tb-cdn.st", "tb-cdn.io", "tb-cdn.cx",
+        "real-debrid.com", "premiumize.me",
+    };
+    for (unsigned i = 0; i < sizeof domains / sizeof *domains; i++)
+        if (host_has_suffix(host, domains[i])) return 1;
+    if (!strcmp(host, "storage.torbox.app")) return 1;
+    if (!strncmp(host, "storage-", 8) && host_has_suffix(host, "torbox.app")) return 1;
+    return 0;
 }
 
 static size_t to_sbuf(char *p, size_t sz, size_t n, void *ud) {

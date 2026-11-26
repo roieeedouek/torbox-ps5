@@ -26,6 +26,7 @@ PATTERN = bytes(i % 251 for i in range(251 * 4096))
 MIB = 1024 * 1024
 ACTIVE = {}
 ACTIVE_LOCK = threading.Lock()
+TB_REQUESTDL = {}
 
 
 def content(start, length):
@@ -56,6 +57,10 @@ ITEMS = {
         {"id": 102, "hash": "def", "name": "Still downloading", "size": 10 * MIB, "active": True,
          "created_at": "2026-11-21T10:00:00Z", "download_state": "downloading", "progress": 0.42,
          "download_present": False, "download_finished": False, "files": []},
+        {"id": 103, "hash": "ghi", "name": "Stalled CDN rotate", "size": 20 * MIB, "active": False,
+         "created_at": "2026-11-22T10:00:00Z", "download_state": "completed", "progress": 1, "download_speed": 0,
+         "download_present": True, "download_finished": True, "cached": True,
+         "files": [file_entry(0, "stalled-cdn.bin", 20 * MIB)]},
     ],
     "webdl": [
         {"id": 201, "name": "flaky-server.bin", "size": 40 * MIB, "created_at": "2026-11-22T10:00:00Z",
@@ -198,7 +203,7 @@ class Handler(BaseHTTPRequestHandler):
                 RD["429"] = int(q["rd_429"])
             return self.send_json(200, {"ok": True})
         if u.path == "/control/stats":
-            return self.send_json(200, {"unrestrict": RD["unrestrict"]})
+            return self.send_json(200, {"unrestrict": RD["unrestrict"], "tb_requestdl": TB_REQUESTDL})
         m = re.match(r"^/rdfile/(\d+)/(\d+)/", u.path)
         if m:
             if time.time() - int(m.group(1)) > RD["ttl"]:
@@ -239,6 +244,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.fail(404, "FILE_NOT_FOUND", "File not found.")
             size = f["size"]
         extra = "&drop=%d" % (7 * MIB) if kind == "webdl" else ""
+        if kind == "torrents":
+            sid = str(item["id"])
+            with ACTIVE_LOCK:
+                n = TB_REQUESTDL.get(sid, 0) + 1
+                TB_REQUESTDL[sid] = n
+            if item["id"] == 103 and n == 1:
+                extra += "&stall=1"
         return self.send_json(200, {"success": True, "error": None, "detail": "ok",
                                     "data": "%s/files/%d?x=1%s" % (host, size, extra)})
 
@@ -249,7 +261,16 @@ class Handler(BaseHTTPRequestHandler):
             if not busy:
                 ACTIVE[path] = ACTIVE.get(path, 0) + 1
         if busy:
-            return self.fail(429, "TOO_MANY", "too many connections")
+            ra = q.get("retry_after")
+            body = json.dumps({"success": False, "error": "TOO_MANY", "detail": "too many connections", "data": None}).encode()
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json")
+            if ra:
+                self.send_header("Retry-After", ra)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         try:
             self.serve_file_body(path, q)
         finally:
@@ -276,11 +297,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(length))
+        if q.get("etag"):
+            tag = "flipped" if q.get("etag_flip") and start > 0 else q["etag"]
+            self.send_header("ETag", '"%s"' % tag)
         if not q.get("norange"):
             self.send_header("Accept-Ranges", "bytes")
         if code == 206:
             self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
         self.end_headers()
+        if q.get("stall") and length > 1:
+            try:
+                self.wfile.write(content(start, 1))
+                self.wfile.flush()
+                time.sleep(30)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return
         drop = int(q.get("drop", 0))
         rate = int(q.get("rate", 0))
         sent, pos = 0, start

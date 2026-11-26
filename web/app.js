@@ -401,8 +401,16 @@ function renderJobs() {
     else if (j.done > 0) parts.push(size(j.done));
     if (running && j.speed > 0) parts.push(size(j.speed) + "/s");
     if (running && j.speed > 0 && j.total > 0) parts.push(duration((j.total - j.done) / j.speed) + " left");
-    if (running && j.conns) parts.push((j.conns > 1 ? j.active + " of " + j.conns + " connections active" : "1 connection") +
-      (j.waiting ? " (" + j.waiting + " waiting: the server limits connections)" : ""));
+    if (running && (j.conns || j.win)) {
+      const target = j.win || j.conns;
+      parts.push((target > 1 ? j.active + " of " + target + " connections active" : "1 connection") +
+        (j.waiting ? " (" + j.waiting + " waiting)" : "") +
+        (j.paused_conns ? " (disk backpressure)" : ""));
+    }
+    if (running && j.disk_speed > 0 && j.paused_conns) parts.push("disk " + size(j.disk_speed) + "/s");
+    if (running && j.cdn) parts.push(j.cdn + (j.http_ver ? " HTTP/" + j.http_ver : ""));
+    if (running && j.rcvbuf > 0) parts.push("rcvbuf " + Math.round(j.rcvbuf / 1024) + " KiB");
+    if (running && j.usb_mode) parts.push("USB sequential");
     const canPause = ["queued", "starting", "downloading"].includes(j.state);
     const canResume = ["paused", "failed", "cancelled"].includes(j.state);
     const canCancel = ["queued", "starting", "downloading", "paused", "failed"].includes(j.state);
@@ -426,6 +434,20 @@ function renderJobs() {
 }
 
 $("#clear").addEventListener("click", () => jobAction("clear", 0));
+async function loadLogs() {
+  $("#logs-body").textContent = "Loading...";
+  try {
+    const r = await fetch("/api/log");
+    $("#logs-body").textContent = r.ok ? await r.text() : "HTTP " + r.status;
+    $("#logs-body").scrollTop = $("#logs-body").scrollHeight;
+  } catch (e) {
+    $("#logs-body").textContent = "Could not load log";
+  }
+}
+$("#logs-btn").addEventListener("click", () => { $("#logs-modal").classList.remove("hidden"); loadLogs(); });
+$("#logs-refresh").addEventListener("click", loadLogs);
+$("#logs-close").addEventListener("click", () => $("#logs-modal").classList.add("hidden"));
+$("#logs-modal").addEventListener("click", (ev) => { if (ev.target.id === "logs-modal") $("#logs-modal").classList.add("hidden"); });
 for (const id of ["#connections", "#parallel"]) {
   $(id).addEventListener("change", () => api("settings", { connections: $("#connections").value, parallel: $("#parallel").value })
     .then(() => toast("Saved (applies to downloads that start from now)")).catch((e) => toast(e.message)));

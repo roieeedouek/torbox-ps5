@@ -392,10 +392,49 @@ static void route_job_action(http_req *r, const char *action) {
 
 static void route_settings(http_req *r) {
     char par[8], con[8];
-    form_get(r->body, "parallel", par, sizeof par);
-    form_get(r->body, "connections", con, sizeof con);
-    dl_settings(par[0] ? atoi(par) : 0, con[0] ? atoi(con) : 0);
+    const char *hp = form_get(r->body, "parallel", par, sizeof par);
+    const char *hc = form_get(r->body, "connections", con, sizeof con);
+    dl_settings(hp && par[0] ? atoi(par) : -1, hc && con[0] ? atoi(con) : -1);
     route_jobs(r);
+}
+
+static void route_log(http_req *r) {
+    char path[600];
+    snprintf(path, sizeof path, "%s/log.txt", plat_app_dir());
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        http_send(r->fd, 200, "text/plain; charset=utf-8", "no log yet\n", 11, NULL);
+        return;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        http_send(r->fd, 200, "text/plain; charset=utf-8", "no log yet\n", 11, NULL);
+        return;
+    }
+    long sz = ftell(f);
+    if (sz < 0) sz = 0;
+    long start = sz > 32768 ? sz - 32768 : 0;
+    size_t want = (size_t)(sz - start);
+    char *buf = malloc(want + 1);
+    if (!buf) {
+        fclose(f);
+        http_send(r->fd, 500, "text/plain", "out of memory", 13, NULL);
+        return;
+    }
+    fseek(f, start, SEEK_SET);
+    size_t got = fread(buf, 1, want, f);
+    fclose(f);
+    buf[got] = 0;
+    const char *out = buf;
+    if (start > 0) {
+        const char *nl = strchr(buf, '\n');
+        if (nl && (size_t)(nl + 1 - buf) < got) {
+            out = nl + 1;
+            got -= (size_t)(out - buf);
+        }
+    }
+    http_send(r->fd, 200, "text/plain; charset=utf-8", out, got, NULL);
+    free(buf);
 }
 
 // SHA-256 of a downloaded file, to check it against a known checksum.
@@ -461,6 +500,7 @@ void api_handle(http_req *r) {
     else if (get && !strncmp(p, "rd/", 3)) route_rd(r, p + 3);
     else if (get && !strcmp(p, "dirs")) route_dirs(r);
     else if (get && !strcmp(p, "jobs")) route_jobs(r);
+    else if (get && !strcmp(p, "log")) route_log(r);
     else if (get && !strcmp(p, "sha256")) route_sha256(r);
     else if (get && !strcmp(p, "speedtest")) route_speedtest(r);
     else if (post && !strcmp(p, "login")) route_login(r);

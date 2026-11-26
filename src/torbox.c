@@ -66,7 +66,9 @@ int tb_request_link(const char *kind, long long item_id, long long file_id, char
     char q[600], ekey[400];
     url_encode(key, ekey, sizeof ekey);
     if (file_id >= 0)
-        snprintf(q, sizeof q, "%s/requestdl?token=%s&%s=%lld&file_id=%lld", kind, ekey, idname, item_id, file_id);
+        snprintf(q, sizeof q,
+                 "%s/requestdl?token=%s&%s=%lld&file_id=%lld&redirect=false&zip_link=false&append_name=false", kind,
+                 ekey, idname, item_id, file_id);
     else snprintf(q, sizeof q, "%s/requestdl?token=%s&%s=%lld&zip_link=true", kind, ekey, idname, item_id);
     sbuf b;
     sb_init(&b);
