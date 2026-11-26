@@ -18,6 +18,19 @@ the TV: the home-screen tile opens it in the PS5's browser).
   continues from the `.part` file and its segment table (`.part.state`); nothing finished is fetched again.
 - A link box: any direct `http(s)://` URL, or, with Real-Debrid, a hoster link it unrestricts.
 
+## Screenshots
+
+The tile on the PS5 home screen, the page in the PS5's browser (opened by the tile), and the same page on a phone
+(item names blurred):
+
+<p>
+  <img src="docs/home-screen.jpg" alt="TorBox Downloader tile on the PS5 home screen" width="100%">
+</p>
+<p>
+  <img src="docs/ps5-browser.jpg" alt="The web UI in the PS5 browser" width="64%">
+  <img src="docs/phone.jpg" alt="The web UI on a phone" width="30%">
+</p>
+
 ## How it runs (and why)
 
 There are two pieces:
