@@ -17,7 +17,7 @@ pids+=($!)
 for _ in $(seq 50); do curl -s -o /dev/null http://127.0.0.1:$mport/ && break; sleep 0.1; done
 start_app() {
     TORBOX_API_BASE=http://127.0.0.1:$mport/v1/api RD_API_BASE=http://127.0.0.1:$mport/rest/1.0 TORBOX_APP_DIR=$work/app TORBOX_DOWNLOADS=$work/dl \
-        TORBOX_ROOTS=$work TORBOX_PORT=$port TORBOX_LOW_SPEED_TIME=2 TORBOX_STALL_MS=4000 ${1+"$@"} "$bin" >> "$work/app.log" 2>&1 &
+        TORBOX_ROOTS=$work TORBOX_PORT=$port TORBOX_LOW_SPEED_TIME=2 TORBOX_STALL_MS=4000 TORBOX_RETRY_MAX_MS=500 ${1+"$@"} "$bin" >> "$work/app.log" 2>&1 &
     app_pid=$!
     pids+=($app_pid)
     for _ in $(seq 50); do curl -s "$base/api/status" > /dev/null && return; sleep 0.1; done
@@ -235,6 +235,60 @@ check "TorBox rotated stalled CDN link ($tb_calls calls)" test "$tb_calls" -ge 2
 # Check /api/log returns telemetry and never leaks credentials or RD direct paths.
 check "log endpoint works" bash -c "curl -s '$base/api/log' | grep -q 'rcvbuf='"
 check "log has no secrets" bash -c "! curl -s '$base/api/log' | grep -qE 'test-key-0000|rd-test-token|rdfile'"
+
+# HTTP 400 mid-download -> TorBox relink & resume without losing bytes.
+post download -d kind=torrents -d id=104 -d file_id=0 --data-urlencode "folder=$work/dl/r400" -d name=http400-rotate.bin > /dev/null
+check "HTTP 400 mid-download relinks and finishes" wait_jobs 60
+check "http400-rotate.bin content" verify "$work/dl/r400/http400-rotate.bin" $((24 * 1048576))
+tb400_calls=$(curl -s "http://127.0.0.1:$mport/control/stats" | jq_ 'd["tb_requestdl"]["104"]')
+check "TorBox rotated HTTP 400 link ($tb400_calls calls)" test "$tb400_calls" -ge 2
+check "HTTP 400 resume logged" bash -c "curl -s '$base/api/log' | grep -q 'resumed'"
+
+# Probe fallback (Range 0-0 -> 400 falls back to Range 0-1023).
+post download -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((16 * 1048576))?bad_probe_zero=1" \
+    --data-urlencode "folder=$work/dl/pf" -d name=probe-fallback.bin > /dev/null
+check "probe 0-0 -> 0-1023 fallback finishes" wait_jobs 60
+check "probe-fallback.bin content" verify "$work/dl/pf/probe-fallback.bin" $((16 * 1048576))
+check "probe fallback logged" bash -c "curl -s '$base/api/log' | grep -q 'retrying with Range 0-1023'"
+
+# HTTP 400 on If-Range -> auto-disable If-Range and succeed.
+post download -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((16 * 1048576))?etag=v1&bad_if_range=1" \
+    --data-urlencode "folder=$work/dl/ifr" -d name=bad-if-range.bin > /dev/null
+check "bad If-Range download finishes" wait_jobs 60
+check "bad-if-range.bin content" verify "$work/dl/ifr/bad-if-range.bin" $((16 * 1048576))
+check "bad If-Range auto-disable logged" bash -c "curl -s '$base/api/log' | grep -q 'disabling If-Range'"
+
+# Transient HTTP 200 (no Range) on retry NEVER deletes .part; also verify paused restart preserves progress.
+id=$(post download -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((32 * 1048576))?rate=1500000&tag=keep200" \
+    --data-urlencode "folder=$work/dl/k200" -d name=keep-partial.bin | jq_ 'd["id"]')
+sleep 2.5
+post jobs/pause -d id="$id" > /dev/null
+sleep 1.5
+kill "$app_pid"; wait "$app_pid" 2>/dev/null || true
+start_app
+peek_done=$(get jobs | jq_ "[j['done'] for j in d['jobs'] if j['name']=='keep-partial.bin'][0]")
+peek_tot=$(get jobs | jq_ "[j['total'] for j in d['jobs'] if j['name']=='keep-partial.bin'][0]")
+check "restarted paused job shows partial progress ($peek_done/$peek_tot)" test "$peek_done" -gt 1000000 -a "$peek_tot" -eq $((32 * 1048576))
+id=$(get jobs | jq_ "[j['id'] for j in d['jobs'] if j['name']=='keep-partial.bin'][0]")
+curl -s "http://127.0.0.1:$mport/control?once_200=keep200" > /dev/null
+post jobs/resume -d id="$id" > /dev/null
+check "transient HTTP 200 kept partial and recovered" wait_jobs 60
+check "keep-partial.bin content" verify "$work/dl/k200/keep-partial.bin" $((32 * 1048576))
+check "keeping partial logged" bash -c "curl -s '$base/api/log' | grep -q 'keeping partial'"
+
+# jobs/remove keeps .part and .part.state on disk so re-queuing resumes.
+id=$(post download -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((32 * 1048576))?rate=1500000" \
+    --data-urlencode "folder=$work/dl/rem" -d name=remove-keeps.bin | jq_ 'd["id"]')
+sleep 2.5
+post jobs/pause -d id="$id" > /dev/null
+sleep 1.5
+rem_done=$(get jobs | jq_ "[j['done'] for j in d['jobs'] if j['id']==$id][0]")
+post jobs/remove -d id="$id" > /dev/null
+check "jobs/remove keeps partial + state ($rem_done bytes)" bash -c "test -f $work/dl/rem/remove-keeps.bin.part && test -f $work/dl/rem/remove-keeps.bin.part.state && test $rem_done -gt 1000000"
+post download -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((32 * 1048576))?rate=1500000" \
+    --data-urlencode "folder=$work/dl/rem" -d name=remove-keeps.bin > /dev/null
+check "re-queued job after remove finishes" wait_jobs 60
+check "remove-keeps.bin content" verify "$work/dl/rem/remove-keeps.bin" $((32 * 1048576))
 
 # USB sequential sliding-window mode + async writer latency decoupling test.
 kill "$app_pid"; wait "$app_pid" 2>/dev/null || true

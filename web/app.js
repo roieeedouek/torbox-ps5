@@ -429,7 +429,12 @@ function renderJobs() {
         canCancel ? el("button", { class: "small danger", type: "button", onclick: () => {
           if (confirm("Cancel and delete the partial file?")) jobAction("cancel", j.id);
         } }, "Cancel") : null,
-        !canPause ? el("button", { class: "small", type: "button", onclick: () => jobAction("remove", j.id) }, "Remove from list") : null));
+        !canPause ? el("button", {
+          class: "small", type: "button",
+          title: (j.state === "failed" || j.state === "paused") ?
+            "Remove from list (keeps any partial file on disk so re-downloading resumes)" : "Remove from list",
+          onclick: () => jobAction("remove", j.id),
+        }, "Remove from list") : null));
   }));
 }
 

@@ -27,6 +27,8 @@ MIB = 1024 * 1024
 ACTIVE = {}
 ACTIVE_LOCK = threading.Lock()
 TB_REQUESTDL = {}
+TOKEN_BYTES = {}
+ONCE_200 = set()
 
 
 def content(start, length):
@@ -61,6 +63,10 @@ ITEMS = {
          "created_at": "2026-11-22T10:00:00Z", "download_state": "completed", "progress": 1, "download_speed": 0,
          "download_present": True, "download_finished": True, "cached": True,
          "files": [file_entry(0, "stalled-cdn.bin", 20 * MIB)]},
+        {"id": 104, "hash": "jkl", "name": "HTTP 400 rotate", "size": 24 * MIB, "active": False,
+         "created_at": "2026-11-23T10:00:00Z", "download_state": "completed", "progress": 1, "download_speed": 0,
+         "download_present": True, "download_finished": True, "cached": True,
+         "files": [file_entry(0, "http400-rotate.bin", 24 * MIB)]},
     ],
     "webdl": [
         {"id": 201, "name": "flaky-server.bin", "size": 40 * MIB, "created_at": "2026-11-22T10:00:00Z",
@@ -201,6 +207,9 @@ class Handler(BaseHTTPRequestHandler):
                 RD["ttl"] = int(q["rd_ttl"])
             if "rd_429" in q:
                 RD["429"] = int(q["rd_429"])
+            if "once_200" in q:
+                with ACTIVE_LOCK:
+                    ONCE_200.add(q["once_200"])
             return self.send_json(200, {"ok": True})
         if u.path == "/control/stats":
             return self.send_json(200, {"unrestrict": RD["unrestrict"], "tb_requestdl": TB_REQUESTDL})
@@ -251,6 +260,10 @@ class Handler(BaseHTTPRequestHandler):
                 TB_REQUESTDL[sid] = n
             if item["id"] == 103 and n == 1:
                 extra += "&stall=1"
+            if item["id"] == 104:
+                extra += "&tok=t104_%d" % n
+                if n == 1:
+                    extra += "&drop=%d&http400_after=%d" % (2 * MIB, 4 * MIB)
         return self.send_json(200, {"success": True, "error": None, "detail": "ok",
                                     "data": "%s/files/%d?x=1%s" % (host, size, extra)})
 
@@ -278,10 +291,37 @@ class Handler(BaseHTTPRequestHandler):
                 ACTIVE[path] -= 1
 
     def serve_file_body(self, path, q):
+        if q.get("bad_if_range") and self.headers.get("If-Range"):
+            self.send_response(400)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        tok = q.get("tok", "")
+        cap400 = int(q.get("http400_after", 0))
+        if tok and cap400:
+            with ACTIVE_LOCK:
+                if TOKEN_BYTES.get(tok, 0) >= cap400:
+                    self.send_response(400)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+        if q.get("bad_probe_zero") and self.headers.get("Range") == "bytes=0-0":
+            body = b"zero-byte range rejected"
+            self.send_response(400)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        force_norange = bool(q.get("norange"))
+        if q.get("tag"):
+            with ACTIVE_LOCK:
+                if q["tag"] in ONCE_200:
+                    ONCE_200.discard(q["tag"])
+                    force_norange = True
         size = int(path.split("/")[2])
         start, end, code = 0, size - 1, 200
         rng = self.headers.get("Range")
-        if rng and not q.get("norange"):
+        if rng and not force_norange:
             m = re.match(r"bytes=(\d*)-(\d*)$", rng)
             if m:
                 start = int(m.group(1) or 0)
@@ -300,7 +340,7 @@ class Handler(BaseHTTPRequestHandler):
         if q.get("etag"):
             tag = "flipped" if q.get("etag_flip") and start > 0 else q["etag"]
             self.send_header("ETag", '"%s"' % tag)
-        if not q.get("norange"):
+        if not force_norange:
             self.send_header("Accept-Ranges", "bytes")
         if code == 206:
             self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
@@ -327,6 +367,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.close_connection = True
                     return
                 self.wfile.write(content(pos, n))
+                if tok:
+                    with ACTIVE_LOCK:
+                        TOKEN_BYTES[tok] = TOKEN_BYTES.get(tok, 0) + n
                 sent += n
                 pos += n
                 if rate:
