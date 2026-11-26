@@ -45,7 +45,8 @@ You need FTP access to the console (e.g. zftpd on port 2120 or 2121) and ShadowM
 1. Copy the `PPSA97630` folder (from the release zip, or `build/PPSA97630` after building) to
    **`/data/homebrew/PPSA97630/`**. With curl:
    ```sh
-   H=ftp://10.0.0.20:2120 D=build/PPSA97630
+   IP=192.168.1.50   # your console's IP
+   H=ftp://$IP:2120 D=build/PPSA97630
    for f in eboot.bin torbox-ps5.elf sce_sys/param.json sce_sys/icon0.png sce_module/libc.prx; do
        curl --disable-epsv --ftp-create-dirs -T "$D/$f" "$H/data/homebrew/PPSA97630/$f"
    done
