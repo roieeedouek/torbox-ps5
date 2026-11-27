@@ -26,7 +26,7 @@ const hashProvider = location.hash.slice(1); // #torbox, #realdebrid or #alldebr
 const state = {
   provider: PROVIDERS[hashProvider] ? hashProvider : PROVIDERS[loadPref("provider", "")] ? loadPref("provider", "") : "torbox",
   tab: { torbox: "torrents", realdebrid: "rd-torrents", alldebrid: "ad-magnets" },
-  lists: {}, open: new Set(), rdInfo: {}, adFiles: {}, status: null, jobs: [], installs: [], served: {}, pollTimer: 0,
+  lists: {}, open: new Set(), rdInfo: {}, adFiles: {}, status: null, jobs: [], installs: [], pollTimer: 0,
   updateChecked: false,
 };
 
@@ -500,14 +500,7 @@ async function pollJobs() {
   try {
     const [r, st] = await Promise.all([api("jobs"), api("streams").catch(() => ({ streams: [] }))]);
     state.jobs = r.jobs;
-    const now = Date.now();
-    state.installs = (st.streams || []).filter((s) => s.install).map((s) => {
-      const prev = state.served[s.id]; // speed from the bytes the installer pulled since the last poll
-      s.speed = prev && now > prev.t && s.served >= prev.b ? (s.served - prev.b) * 1000 / (now - prev.t) : 0;
-      if (prev && s.speed === 0 && s.active && prev.speed) s.speed = prev.speed * 0.5;
-      state.served[s.id] = { t: now, b: s.served, speed: s.speed };
-      return s;
-    });
+    state.installs = (st.streams || []).filter((s) => s.install); // speed: measured on the console
     $("#connections").value = String(r.connections);
     $("#parallel").value = String(r.parallel);
     if (!$("#connections").value) $("#connections").append(el("option", {}, String(r.connections))), $("#connections").value = String(r.connections);

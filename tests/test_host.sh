@@ -317,6 +317,26 @@ r=$(post install -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files
 ptok=$(jq_ 'd.get("token", "")' <<<"$r")
 check "install: a PS5 that stops pulling shows as failed" wait_install "$ptok" failed 60
 check "install: the failure says why" bash -c "curl -s $base/api/streams | grep -q 'stopped downloading the package'"
+# Progress and speed move while it installs (not only when each 18 MiB request ends).
+r=$(post install -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((48 * 1048576))?rate=1000000" -d name=slow.pkg)
+stok=$(jq_ 'd.get("token", "")' <<<"$r")
+samples=""
+for _ in $(seq 10); do
+    sleep 0.5
+    samples+="$(get streams | jq_ "[str(x['served'])+':'+str(int(x['speed'])) for x in d['streams'] if x['id']=='${stok:0:8}'][0]") "
+done
+smooth() {
+    python3 -I - "$1" <<'EOF'
+import sys
+pts = [tuple(map(int, p.split(":"))) for p in sys.argv[1].split()]
+served = [p[0] for p in pts]
+steps = [b - a for a, b in zip(served, served[1:]) if b > a]
+# counted while a request runs: steps smaller than one whole 18 MiB installer request, and a speed shown
+sys.exit(0 if len(steps) >= 2 and any(x < 18 * 1048576 for x in steps) and any(p[1] > 0 for p in pts) else 1)
+EOF
+}
+check "install: progress grows smoothly and speed is shown ($samples)" smooth "$samples"
+check "install: slow one finishes" wait_install "$stok" installed 90
 kill $shsrv_pid; wait $shsrv_pid 2>/dev/null || true
 post install -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((8 * 1048576))" -d name=noshell.pkg > "$work/noshell.json"
 check "install: no shsrv gives a readable error" grep -q "shsrv, port $sport) is not running" "$work/noshell.json"

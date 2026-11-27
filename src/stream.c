@@ -40,6 +40,8 @@ typedef struct {
     int ra_running, ra_quit; // ra_quit: asked to stop (the stream is being removed)
     pthread_cond_t cv;
     // Install through the helper (helper/installer.c), when the stream was made for one.
+    double speed;            // bytes/s the installer is pulling, smoothed by the monitor
+    int64_t sp_bytes, sp_ms; // the monitor's last sample of `served`
     int ins; // 0 none, 1 starting, 2 installing (the PS5 pulls the package), 3 done, 4 failed
     char ins_status[24], ins_err[200], content_id[48];
     int64_t ins_done, ins_total, ins_started_ms, ins_finished_ms, ins_report_ms;
@@ -409,8 +411,8 @@ static void refresh_link(const char *tok, int reqno, const char *kind, const cha
 }
 
 // Sends bytes a..b of the stream to the installer. Returns the bytes sent; *why says how it ended.
-static int64_t serve_range(int fd, const char *tok, int reqno, const char *kind, const char *link, char **direct,
-                           int64_t a, int64_t b, const char **why) {
+static int64_t serve_range(int fd, stream_t *s, const char *tok, int reqno, const char *kind, const char *link,
+                           char **direct, int64_t a, int64_t b, const char **why) {
     pthread_once(&g_share_once, share_init);
     CURLM *m = curl_multi_init();
     if (!m) {
@@ -488,6 +490,9 @@ static int64_t serve_range(int fd, const char *tok, int reqno, const char *kind,
                 break;
             }
             sent += (int64_t)pt->got;
+            pthread_mutex_lock(&g_lock); // counted as it goes, so progress and speed move smoothly
+            if (!strcmp(s->token, tok)) s->served += (int64_t)pt->got, s->last_ms = plat_now_ms();
+            pthread_mutex_unlock(&g_lock);
             pt->state = 0, pt->got = 0;
             next_send++;
         }
@@ -785,6 +790,7 @@ static int64_t serve_window(int fd, stream_t *s, const char *tok, int64_t a, int
             break;
         }
         off += (int64_t)n, sent += (int64_t)n;
+        if (!strcmp(s->token, tok)) s->served += (int64_t)n, s->last_ms = plat_now_ms();
     }
     s->pos[me] = -1; // the window stays where it is for the installer's next request
     pthread_mutex_unlock(&g_lock);
@@ -883,7 +889,7 @@ void stream_handle(http_req *r) {
         int gone = 0;
         if (b - a + 1 >= (1 << 20)) sent = serve_window(r->fd, s, tok, a, b, &next, &gone); // large reads
         if (gone) why = "installer closed the connection";
-        else if (next <= b) sent += serve_range(r->fd, tok, reqno, kind, link, &direct, next, b, &why);
+        else if (next <= b) sent += serve_range(r->fd, s, tok, reqno, kind, link, &direct, next, b, &why);
     }
 out:;
     int64_t ms = plat_now_ms() - t0;
@@ -894,7 +900,6 @@ out:;
     free(link);
     pthread_mutex_lock(&g_lock);
     if (!strcmp(s->token, tok)) {
-        s->served += sent;
         s->active--;
         s->last_ms = plat_now_ms();
     }
@@ -981,11 +986,17 @@ static void *monitor_thread(void *arg) {
     if (env && atoi(env) > 0) quiet_stall = atoi(env);
 #endif
     for (;;) {
-        plat_sleep_ms(quiet_done < 3000 ? 500 : 3000);
+        plat_sleep_ms(quiet_done < 3000 ? 500 : 1000);
         pthread_mutex_lock(&g_lock);
         int64_t now = plat_now_ms();
         for (int i = 0; i < MAX_STREAMS; i++) {
             stream_t *s = &g_streams[i];
+            if (s->token[0] && now - s->sp_ms >= 900) { // speed over the last second, smoothed
+                double inst = s->sp_ms ? (double)(s->served - s->sp_bytes) * 1000.0 / (double)(now - s->sp_ms) : 0;
+                if (inst < 0) inst = 0;
+                s->speed = !s->active && inst == 0 ? 0 : s->speed > 0 ? s->speed * 0.6 + inst * 0.4 : inst;
+                s->sp_bytes = s->served, s->sp_ms = now;
+            }
             if (s->ins != 2) continue;
             s->ins_done = s->served;
             s->ins_total = s->size;
@@ -1127,13 +1138,14 @@ void stream_list_json(sbuf *out) {
         if (!s->token[0]) continue;
         sb_printf(out, "%s{\"id\":\"%.8s\",\"kind\":\"%s\",\"size\":%lld,\"served\":%lld,\"requests\":%d,\"active\":%d,"
                        "\"idle_s\":%lld,\"install\":\"%s\",\"ins_done\":%lld,\"ins_total\":%lld,"
-                       "\"ins_age_s\":%lld,\"report_age_s\":%lld,\"ins_time_s\":%lld,\"name\":",
+                       "\"ins_age_s\":%lld,\"report_age_s\":%lld,\"ins_time_s\":%lld,\"speed\":%.0f,\"name\":",
                   first ? "" : ",", s->token, s->kind, (long long)s->size, (long long)s->served, s->requests, s->active,
                   (long long)((now - s->last_ms) / 1000), ins_names[s->ins], (long long)s->ins_done,
                   (long long)s->ins_total, s->ins ? (long long)((now - s->ins_started_ms) / 1000) : -1,
                   s->ins ? (long long)((now - s->ins_report_ms) / 1000) : -1,
                   s->ins_finished_ms > s->ins_started_ms ? (long long)((s->ins_finished_ms - s->ins_started_ms) / 1000)
-                                                         : -1);
+                                                         : -1,
+                  s->speed);
         sb_json_str(out, s->name);
         sb_puts(out, ",\"status\":");
         sb_json_str(out, s->ins_status);
