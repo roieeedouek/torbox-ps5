@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define APP_VERSION "1.1.1"
+#define APP_VERSION "1.1.2"
 #define APP_TITLE_ID "PPSA97630"
 #define APP_REPO "roieeedouek/torbox-ps5" // GitHub repository whose releases the update check reads
 #define APP_PORT 8089
@@ -164,7 +164,8 @@ typedef struct {
     size_t body_len;
     int has_app_header; // X-TorBox-PS5 present (refuses cross-site form posts)
 } http_req;
-int httpd_run(int port); // returns when httpd_stop() is called; -1 if the port cannot be bound
+int httpd_listen(int port); // binds and listens: the socket, or -1 if the port is taken
+int httpd_run(int listen_fd); // serves until httpd_stop() is called
 void httpd_stop(void);
 void http_send(int fd, int status, const char *ctype, const void *body, size_t len, const char *extra_headers);
 void http_send_json(int fd, int status, const sbuf *body);

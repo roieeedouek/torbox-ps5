@@ -162,7 +162,7 @@ static void *conn_thread(void *arg) {
     return NULL;
 }
 
-int httpd_run(int port) {
+int httpd_listen(int port) {
     signal(SIGPIPE, SIG_IGN);
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return -1;
@@ -178,6 +178,11 @@ int httpd_run(int port) {
         return -1;
     }
     plat_log("listening on port %d", port);
+    return s;
+}
+
+int httpd_run(int s) {
+    int one = 1;
     while (!g_stop) {
         if (wait_fd(s, POLLIN, 500) <= 0) continue;
         int c = accept(s, NULL, NULL);

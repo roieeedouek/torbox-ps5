@@ -377,7 +377,20 @@ TORBOX_APP_DIR=$work/app TORBOX_DOWNLOADS=$work/dl TORBOX_ROOTS=$work TORBOX_POR
 pids+=($!)
 for _ in $(seq 50); do curl -s "http://127.0.0.1:$oldport/api/status" > /dev/null && break; sleep 0.1; done
 check "old server up on its port" bash -c "curl -s -m 2 http://127.0.0.1:$oldport/api/status | grep -q providers"
-start_app env TORBOX_LEGACY_PORT=$oldport TORBOX_LEGACY_SETTLE_MS=300
+# The new server waits 2.5 s after the old one is gone; a second copy started meanwhile must give up at once
+# (port taken) without loading the queue.
+newenv=(TORBOX_API_BASE=http://127.0.0.1:$mport/v1/api TORBOX_APP_DIR=$work/app TORBOX_DOWNLOADS=$work/dl TORBOX_ROOTS=$work
+    TORBOX_PORT=$port TORBOX_LEGACY_PORT=$oldport TORBOX_LEGACY_SETTLE_MS=2500)
+env "${newenv[@]}" "$bin" >> "$work/app.log" 2>&1 &
+app_pid=$!
+pids+=($app_pid)
+sleep 0.7
+t0=$SECONDS
+second=0
+env "${newenv[@]}" timeout 10 "$bin" >> "$work/app-second.log" 2>&1 || second=$?
+check "second copy during the wait exits at once (code $second, $((SECONDS - t0)) s)" test "$second" -eq 1 -a $((SECONDS - t0)) -le 2
+check "second copy did not load the queue" bash -c "! grep -q 'restored\|job ' $work/app-second.log && grep -q 'busy' $work/app-second.log"
+for _ in $(seq 50); do curl -s "$base/api/status" > /dev/null && break; sleep 0.1; done
 check "new server stopped the old one" bash -c "! curl -s -m 2 http://127.0.0.1:$oldport/api/status > /dev/null"
 check "new server answers" bash -c "curl -s -m 2 $base/api/status | grep -q providers"
 check "stopping the old server logged" bash -c "grep -q 'older TorBox server answers on port $oldport' $work/app/log.txt"

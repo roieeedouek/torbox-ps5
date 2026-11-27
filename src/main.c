@@ -47,8 +47,9 @@ static int local_http(int port, const char *req, char *out, size_t len) {
 
 // Versions before 1.1.1 listened on APP_LEGACY_PORT. If one of them still runs, two servers would work on the
 // same queue and partial files: ask it to quit, wait until its port closes, then give its downloads time to stop
-// and save their state (its shutdown waits up to 10 s for them).
-static void stop_legacy_server(void) {
+// and save their state (its shutdown waits up to 10 s for them). Only a server that says it is TorBox for PS5
+// (its /api/status) is asked; any other app on that port just sees one GET.
+static void stop_legacy_server(int own_port) {
     int port = APP_LEGACY_PORT, settle_ms = 11000;
 #ifndef __PROSPERO__
     const char *env = getenv("TORBOX_LEGACY_PORT"); // tests; 0 = don't look
@@ -56,11 +57,12 @@ static void stop_legacy_server(void) {
     env = getenv("TORBOX_LEGACY_SETTLE_MS");
     if (env) settle_ms = atoi(env);
 #endif
-    if (port <= 0 || port == APP_PORT) return;
+    if (port <= 0 || port == own_port) return;
     static char buf[8192];
     if (local_http(port, "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", buf, sizeof buf) <= 0)
         return;
-    if (!strstr(buf, "\"providers\"") || !strstr(buf, "\"default_folder\"")) return; // not a TorBox server
+    if (!strstr(buf, "\"providers\"") || !strstr(buf, "\"default_folder\"") || !strstr(buf, "\"title\":\"TorBox\""))
+        return; // not a TorBox for PS5 server
     plat_log("an older TorBox server answers on port %d: stopping it", port);
     local_http(port,
                "POST /api/quit HTTP/1.1\r\nHost: 127.0.0.1\r\nX-TorBox-PS5: 1\r\nContent-Length: 0\r\n"
@@ -86,15 +88,19 @@ int torbox_main(void) {
     int port = APP_PORT;
     const char *env = getenv("TORBOX_PORT");
     if (env && atoi(env) > 0) port = atoi(env);
-    stop_legacy_server(); // before the queue is loaded
+    // Claim the port before anything else: a second copy started meanwhile (the tile opened twice, a payload sent
+    // again) then stops here, before it loads the queue or starts any download.
+    int lfd = httpd_listen(port);
+    if (lfd < 0) {
+        plat_notify("TorBox: port %d is busy (already running?)", port);
+        return 1;
+    }
+    stop_legacy_server(port); // before the queue is loaded; connections wait in the listen backlog meanwhile
     dl_init(3);
     char ip[64];
     plat_local_ip(ip, sizeof ip);
     plat_notify("TorBox: open http://%s:%d in a browser", ip, port);
-    if (httpd_run(port) < 0) {
-        plat_notify("TorBox: port %d is busy (already running?)", port);
-        return 1;
-    }
+    httpd_run(lfd);
     dl_shutdown();
     plat_notify("TorBox: server stopped");
     return 0;
