@@ -19,7 +19,7 @@ for _ in $(seq 50); do curl -s -o /dev/null http://127.0.0.1:$mport/ && break; s
 start_app() {
     TORBOX_API_BASE=http://127.0.0.1:$mport/v1/api RD_API_BASE=http://127.0.0.1:$mport/rest/1.0 AD_API_BASE=http://127.0.0.1:$mport AD_DELAYED_POLL_MS=200 \
         TORBOX_UPDATE_URL=http://127.0.0.1:$mport/repos/x/torbox-ps5/releases/latest TORBOX_APP_DIR=$work/app TORBOX_DOWNLOADS=$work/dl \
-        TORBOX_ROOTS=$work TORBOX_PORT=$port TORBOX_LOW_SPEED_TIME=2 TORBOX_STALL_MS=4000 TORBOX_RETRY_MAX_MS=500 ${1+"$@"} "$bin" >> "$work/app.log" 2>&1 &
+        TORBOX_ROOTS=$work TORBOX_PORT=$port TORBOX_LOW_SPEED_TIME=2 TORBOX_STALL_MS=4000 TORBOX_RETRY_MAX_MS=500 TORBOX_LEGACY_PORT=0 ${1+"$@"} "$bin" >> "$work/app.log" 2>&1 &
     app_pid=$!
     pids+=($app_pid)
     for _ in $(seq 50); do curl -s "$base/api/status" > /dev/null && return; sleep 0.1; done
@@ -369,6 +369,20 @@ check "key not in log" bash -c "! grep -rq test-key-0000 $work/app/log.txt $work
 post quit -X POST > /dev/null
 sleep 1
 check "quit stops server" bash -c "! curl -s -m 2 $base/api/status > /dev/null"
+
+# An older version still listening on its old port is stopped before the new server loads the queue.
+oldport=18090
+TORBOX_APP_DIR=$work/app TORBOX_DOWNLOADS=$work/dl TORBOX_ROOTS=$work TORBOX_PORT=$oldport TORBOX_LEGACY_PORT=0 \
+    "$bin" >> "$work/app-old.log" 2>&1 &
+pids+=($!)
+for _ in $(seq 50); do curl -s "http://127.0.0.1:$oldport/api/status" > /dev/null && break; sleep 0.1; done
+check "old server up on its port" bash -c "curl -s -m 2 http://127.0.0.1:$oldport/api/status | grep -q providers"
+start_app env TORBOX_LEGACY_PORT=$oldport TORBOX_LEGACY_SETTLE_MS=300
+check "new server stopped the old one" bash -c "! curl -s -m 2 http://127.0.0.1:$oldport/api/status > /dev/null"
+check "new server answers" bash -c "curl -s -m 2 $base/api/status | grep -q providers"
+check "stopping the old server logged" bash -c "grep -q 'older TorBox server answers on port $oldport' $work/app/log.txt"
+post quit -X POST > /dev/null
+sleep 1
 echo "$fails failure(s); work dir $work"
 [[ $fails == 0 ]] && rm -rf "$work"
 exit $((fails > 0))

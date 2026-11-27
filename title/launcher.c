@@ -2,9 +2,9 @@
 //
 // The server runs as an elfldr payload, not inside this title: a title is closed when another game starts (and
 // stopped in rest mode), which would cut downloads off. The payload keeps running while the user plays.
-// Flow: if nothing answers on port 8080 yet, stream /app0/torbox-ps5.elf to elfldr on 127.0.0.1:9021 and wait
-// for the server; then open the console's web browser on http://127.0.0.1:8080 (the same page phones and PCs
-// use), and exit.
+// Flow: if nothing answers on port 8089 yet, stream /app0/torbox-ps5.elf to elfldr on 127.0.0.1:9021 and wait
+// for the server (which first stops a server of an older version on port 8080); then open the console's web
+// browser on http://127.0.0.1:8089 (the same page phones and PCs use), and exit.
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -26,7 +26,7 @@ int sceSystemServiceLoadExec(const char *path, char *const argv[]);
 int sceSystemServiceLaunchWebBrowser(const char *uri, void *param);
 int sceUserServiceInitialize(void *param);
 
-#define SERVER_PORT 8080
+#define SERVER_PORT 8089
 #define ELFLDR_PORT 9021
 #define PAYLOAD "/app0/torbox-ps5.elf"
 
@@ -122,13 +122,14 @@ int main(void) {
                              "torbox-ps5.elf to it yourself. (%s)", "no server started");
         else if (rc) notify("TorBox: could not start the server (%s)", rc == -2 ? "torbox-ps5.elf missing" : "send failed");
         else {
-            for (int i = 0; i < 50 && !(up = server_up()); i++) usleep(200 * 1000);
+            // Up to 25 s: the server first stops an older version on port 8080, which can take ~12 s.
+            for (int i = 0; i < 125 && !(up = server_up()); i++) usleep(200 * 1000);
             if (!up) notify("TorBox: the server did not answer on %s yet", url); // when up, it says so itself
         }
     }
     if (up) {
         sceUserServiceInitialize(NULL);
-        if (sceSystemServiceLaunchWebBrowser("http://127.0.0.1:" "8080", NULL))
+        if (sceSystemServiceLaunchWebBrowser("http://127.0.0.1:" "8089", NULL))
             notify("TorBox is running: open %s from a phone or PC", url);
     }
     sleep(2); // let the browser come up / the notification show before the title closes

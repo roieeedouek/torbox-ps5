@@ -2,7 +2,7 @@
 
 Browse your [TorBox](https://torbox.app), [Real-Debrid](https://real-debrid.com) and
 [AllDebrid](https://alldebrid.com) accounts and download their
-files **onto a jailbroken PS5**, from a web page you open on your phone or PC: `http://<console-ip>:8080` (or on
+files **onto a jailbroken PS5**, from a web page you open on your phone or PC: `http://<console-ip>:8089` (or on
 the TV: the home-screen tile opens it in the PS5's browser).
 
 - Three services, switched at the top of the page, each with its own login (TorBox API key, Real-Debrid API token,
@@ -49,7 +49,7 @@ There are two pieces:
 | Piece | What it is | Why |
 |---|---|---|
 | `torbox-ps5.elf` | The web server and downloader, a payload for the ELF loader (elfldr, port 9021). | Runs in the background, independent of any app: downloads continue while you play. |
-| `PPSA97630` title | A home-screen tile, "TorBox Downloader". Opening it starts the server if it isn't running (sends `torbox-ps5.elf` to elfldr on `127.0.0.1:9021`), opens the PS5's web browser on `http://127.0.0.1:8080` (the same page, on the TV, controlled with the controller), and closes itself. | One tap to start and use, like your other homebrew. |
+| `PPSA97630` title | A home-screen tile, "TorBox Downloader". Opening it starts the server if it isn't running (sends `torbox-ps5.elf` to elfldr on `127.0.0.1:9021`), opens the PS5's web browser on `http://127.0.0.1:8089` (the same page, on the TV, controlled with the controller), and closes itself. | One tap to start and use, like your other homebrew. |
 
 The server is deliberately **not** inside the title. A PS5 game or app is closed when another game starts and
 stops in rest mode. A server living in the title would cut downloads off as soon as you started a game. The
@@ -87,7 +87,7 @@ You need FTP access to the console (e.g. zftpd on port 2120 or 2121) and ShadowM
    ```
    The last command sets the two modes (or use your FTP client's chmod, or the shell server's `chmod 755 <file>`).
 2. Register the title with ShadowMountPlus. "TorBox Downloader" appears on the home screen.
-3. Open the tile. The server starts (a notification shows `TorBox: open http://<console-ip>:8080 in a browser`)
+3. Open the tile. The server starts (a notification shows `TorBox: open http://<console-ip>:8089 in a browser`)
    and the PS5's browser opens on the page. You can also use the page from a phone or PC at that address.
 
 **Without the title:** send the payload yourself: `cat torbox-ps5.elf > /dev/tcp/<console-ip>/9021` (Linux/WSL),
@@ -95,13 +95,15 @@ or with any payload sender to port 9021.
 
 **Update:** the page shows a notice when a newer release is out (the console asks the GitHub API for the
 latest release of this repository, at most every 6 hours; nothing about you or your accounts is sent). Press
-*Stop server* on the page, replace the files, start again. Downloads resume.
+*Stop server* on the page, replace the files, start again. Downloads resume. Since 1.1.1 the page is on port
+**8089** (it was 8080): a new server that finds an older one still running on 8080 stops it first, so two servers
+never work on the same downloads.
 
 ## Use
 
-1. On a phone or PC on the same network open `http://<console-ip>:8080`.
+1. On a phone or PC on the same network open `http://<console-ip>:8089`.
 2. Pick the service at the top (*TorBox*, *Real-Debrid* or *AllDebrid*; a dot marks the ones you are logged in
-   to; `http://<console-ip>:8080/#realdebrid` or `#alldebrid` opens one directly) and paste its key:
+   to; `http://<console-ip>:8089/#realdebrid` or `#alldebrid` opens one directly) and paste its key:
    - TorBox: the API key from torbox.app, Settings, API Key.
    - Real-Debrid: the private API token from <https://real-debrid.com/apitoken> (while logged in there).
    - AllDebrid: an API key from <https://alldebrid.com/apikeys> (while logged in there).
@@ -181,7 +183,7 @@ Measured on this console (fw 13.60) on the owner's network:
 - Writes go through their own thread in blocks of up to 2 MiB, so a slow write never holds up the network. The
   console's internal storage took 130 to 180 MB/s of writes, and kept up at 100 MB/s with writes of about 12 ms.
 - If you get much less, check the console's own link first. Open
-  `http://<console-ip>:8080/api/speedtest?mb=200` on a PC on the same network: it streams 200 MB from the
+  `http://<console-ip>:8089/api/speedtest?mb=200` on a PC on the same network: it streams 200 MB from the
   console (a PC on Wi-Fi limits this test too). A wired console is the safest bet.
 
 ## Files on the console
@@ -203,7 +205,7 @@ The server also logs to klog (port 3232). *Logs* on the page (or `GET /api/log`)
 ## Security notes
 
 - The page has no password: anyone on your network can use it while the server runs (but cannot read the key).
-  Stop the server when you don't need it, and don't expose port 8080 to the internet.
+  Stop the server when you don't need it, and don't expose port 8089 to the internet.
 - Changes need an `X-TorBox-PS5` request header, so a web page on another site cannot drive the server from your
   browser.
 - Folders are limited to `/data/...`, `/mnt/usbN/...` and `/mnt/extN/...`.

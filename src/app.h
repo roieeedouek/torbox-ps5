@@ -3,10 +3,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define APP_VERSION "1.1.0"
+#define APP_VERSION "1.1.1"
 #define APP_TITLE_ID "PPSA97630"
 #define APP_REPO "roieeedouek/torbox-ps5" // GitHub repository whose releases the update check reads
-#define APP_PORT 8080
+#define APP_PORT 8089
+#define APP_LEGACY_PORT 8080 // versions before 1.1.1 listened here: a new server stops such an old one first
 #define THREAD_STACK (1024 * 1024) // below 2 MiB: titles take bigger stacks from the small flexible pool
 
 // ---- platform (platform.c) ----
