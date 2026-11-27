@@ -162,11 +162,22 @@ Measured on this console (fw 13.60) on the owner's network:
 - The console gives sockets a 64 KiB TCP receive buffer, which held one connection at about 1.2 MB/s
   (window / round-trip time). The app asks for up to 2 MiB; the console grants 512 KiB, which gave about 7.9 MB/s
   on one connection to a public mirror.
-- TorBox downloads: about **100 MB/s with 16 connections**, about 52 MB/s with 8 (version
-  1.0.0, which gave each connection its own thread and wrote to disk from it, stayed at 15 to 26 MB/s). 32
-  connections made TorBox's CDN stall most of them, so the setting stops at 16.
-- At 16 connections the one network thread is busy about 90% of the time, so the console's CPU (TLS decryption)
-  is the next limit.
+- One large file, 35 s per setting after a 10 s ramp-up (MB/s; 2026-11-27):
+
+  | Connections | TorBox | Real-Debrid | AllDebrid |
+  |---|---|---|---|
+  | 8 | 51 | 85 | 53 |
+  | 16 | 71 (100 on another CDN server) | 84 | 72 |
+  | 24 | 58 | 83 | 55 |
+  | 32 | 68 | 78 (only ~24 connections allowed) | 74 |
+
+  **16 (or *Auto*, which ends up at 16) is the best setting for all three.** Real-Debrid is already at its best
+  with 8; more than 16 brings nothing. The server you get matters more than the setting: TorBox gave 100 MB/s on one
+  CDN server and 70 on another. Two files at a time gave the same total as one (about 70 MB/s), so *Files at a time*
+  doesn't make downloads faster; with 1, each file finishes sooner. Version 1.0.0, which gave each connection its
+  own thread and wrote to disk from it, stayed at 15 to 26 MB/s.
+- At 16 connections the one network thread is busy 60 to 90% of the time, so at 100 MB/s the console's CPU (TLS
+  decryption) is the next limit.
 - Writes go through their own thread in blocks of up to 2 MiB, so a slow write never holds up the network. The
   console's internal storage took 130 to 180 MB/s of writes, and kept up at 100 MB/s with writes of about 12 ms.
 - If you get much less, check the console's own link first. Open
