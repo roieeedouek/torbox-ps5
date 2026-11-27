@@ -96,6 +96,7 @@ int torbox_main(void) {
         return 1;
     }
     stop_legacy_server(port); // before the queue is loaded; connections wait in the listen backlog meanwhile
+    stream_init();
     dl_init(3);
     char ip[64];
     plat_local_ip(ip, sizeof ip);

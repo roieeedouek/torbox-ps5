@@ -60,6 +60,8 @@ static const char *status_text(int s) {
     case 401: return "Unauthorized";
     case 403: return "Forbidden";
     case 404: return "Not Found";
+    case 206: return "Partial Content";
+    case 416: return "Range Not Satisfiable";
     case 405: return "Method Not Allowed";
     case 413: return "Payload Too Large";
     case 500: return "Internal Server Error";
@@ -120,6 +122,14 @@ static void handle(int fd) {
         char *h = line + 2;
         if (!strncasecmp(h, "Content-Length:", 15)) clen = strtoul(h + 15, NULL, 10);
         else if (!strncasecmp(h, "X-TorBox-PS5:", 13)) req.has_app_header = 1;
+        else if (!strncasecmp(h, "Range:", 6)) {
+            const char *v = h + 6;
+            while (*v == ' ' || *v == '\t') v++;
+            size_t n = strcspn(v, "\r\n");
+            if (n >= sizeof req.range) n = sizeof req.range - 1;
+            memcpy(req.range, v, n);
+            req.range[n] = 0;
+        }
     }
     if (clen > MAX_BODY) {
         http_send(fd, 413, "text/plain", "too large", 9, NULL);

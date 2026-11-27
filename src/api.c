@@ -234,6 +234,30 @@ static void route_update(http_req *r) {
     sb_free(&b);
 }
 
+// Streaming to the PS5's package installer: POST /api/stream (kind, url) -> {"url": local stream address, ...}.
+static void route_stream_create(http_req *r) {
+    char kind[16], err[300] = "";
+    char *url = malloc(8192);
+    if (!url) return;
+    form_get(r->body, "kind", kind, sizeof kind);
+    form_get(r->body, "url", url, 8192);
+    sbuf b;
+    sb_init(&b);
+    if (stream_create(kind, url, &b, err, sizeof err)) json_err(r->fd, 400, err);
+    else http_send_json(r->fd, 200, &b);
+    memset(url, 0, 8192);
+    free(url);
+    sb_free(&b);
+}
+
+static void route_streams(http_req *r) {
+    sbuf b;
+    sb_init(&b);
+    stream_list_json(&b);
+    http_send_json(r->fd, 200, &b);
+    sb_free(&b);
+}
+
 static int cmp_str(const void *a, const void *b) { return strcasecmp(*(char *const *)a, *(char *const *)b); }
 
 static void add_roots(sbuf *b) {
@@ -525,6 +549,11 @@ static void route_static(http_req *r) {
 
 void api_handle(http_req *r) {
     int get = !strcmp(r->method, "GET"), post = !strcmp(r->method, "POST");
+    if (!strncmp(r->path, "/stream/", 8)) {
+        if (get || !strcmp(r->method, "HEAD")) stream_handle(r);
+        else http_send(r->fd, 405, "text/plain", "method not allowed", 18, NULL);
+        return;
+    }
     if (strncmp(r->path, "/api/", 5)) {
         if (get) route_static(r);
         else http_send(r->fd, 405, "text/plain", "method not allowed", 18, NULL);
@@ -550,6 +579,8 @@ void api_handle(http_req *r) {
     else if (post && !strcmp(p, "mkdir")) route_mkdir(r);
     else if (post && !strcmp(p, "download")) route_download(r);
     else if (post && !strcmp(p, "settings")) route_settings(r);
+    else if (post && !strcmp(p, "stream")) route_stream_create(r);
+    else if (get && !strcmp(p, "streams")) route_streams(r);
     else if (post && !strncmp(p, "jobs/", 5)) route_job_action(r, p + 5);
     else if (post && !strcmp(p, "quit")) {
         json_ok(r->fd);

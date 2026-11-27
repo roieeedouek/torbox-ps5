@@ -252,6 +252,43 @@ check "AD: logout keeps TorBox" bash -c "test ! -e $work/app/alldebrid-key.txt &
 check "AD: lists refused after logout" bash -c "curl -s '$base/api/ad/magnets' | grep -q 'not logged in'"
 check "AD: key and direct links not in logs" bash -c "! grep -rqE 'ad-test-key-1|adfile' $work/app/log.txt $work/app.log"
 
+# ---------- streaming to the PS5 package installer ----------
+r=$(post stream -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((80 * 1048576))?drop=3000000")
+surl=$(jq_ 'd.get("url", "")' <<<"$r")
+check "stream: created with size" bash -c "python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d[\"ok\"] and d[\"size\"]==80*1048576 and \"/stream/\" in d[\"url\"]' '$r'"
+check "stream: HEAD gives size and ranges" bash -c "curl -s -I '$surl' | tr -d '\r' | grep -q 'Content-Length: $((80 * 1048576))' && curl -s -I '$surl' | grep -qi 'accept-ranges: bytes'"
+check "stream: unknown token refused" bash -c "[[ \$(curl -s -o /dev/null -w '%{http_code}' $base/stream/0123456789abcdef0123456789abcdef/x.pkg) == 404 ]]"
+stream_read() { # url: the installer's pattern (header, tail, then 18 MiB ranges two at a time) must give exact bytes
+    python3 -I - "$1" "$2" <<'EOF'
+import sys, threading, urllib.request
+u, size = sys.argv[1], int(sys.argv[2])
+def get(a, b):
+    return urllib.request.urlopen(urllib.request.Request(u, headers={"Range": "bytes=%d-%d" % (a, b)})).read()
+def ok(data, start):
+    return all(data[i] == (start + i) % 251 for i in range(len(data)))
+good = ok(get(0, 65535), 0) and ok(get(size - 65536, size - 1), size - 65536)
+chunk = 18 << 20
+starts, res = list(range(65536, size, chunk)), {}
+def worker():
+    while starts:
+        try:
+            a = starts.pop(0)
+        except IndexError:
+            return
+        res[a] = get(a, min(a + chunk, size) - 1)
+ts = [threading.Thread(target=worker) for _ in range(2)]
+[t.start() for t in ts]
+[t.join() for t in ts]
+good = good and sum(len(v) for v in res.values()) == size - 65536 and all(ok(v, a) for a, v in res.items())
+sys.exit(0 if good else 1)
+EOF
+}
+check "stream: installer read pattern through a dropping server" stream_read "$surl" $((80 * 1048576))
+kill "$app_pid"; wait "$app_pid" 2>/dev/null || true
+start_app
+check "stream: same URL works after a restart" bash -c "curl -s -r 1048576-2097151 '$surl' | python3 -I -c 'import sys; d=sys.stdin.buffer.read(); sys.exit(0 if len(d)==1048576 and all(d[i]==(1048576+i)%251 for i in range(len(d))) else 1)'"
+check "stream: listed" bash -c "curl -s $base/api/streams | grep -q '\"requests\"'"
+
 # ---------- update check ----------
 r=$(get update)
 check "update: newer release offered" bash -c "python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d[\"newer\"] and d[\"latest\"]==\"v9.9.9\" and d[\"url\"].endswith(\"v9.9.9\")' '$r'"
