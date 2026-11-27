@@ -15,11 +15,16 @@ trap cleanup EXIT
 
 python3 -I "$here/tests/mock_torbox.py" $mport > "$work/mock.log" 2>&1 &
 pids+=($!)
+sport=18323 # a stand-in for shsrv's pkg_install (Stream Install)
+python3 -I "$here/tests/fake_shsrv.py" $sport "$work/installs.txt" > "$work/shsrv.log" 2>&1 &
+shsrv_pid=$!
+pids+=($shsrv_pid)
 for _ in $(seq 50); do curl -s -o /dev/null http://127.0.0.1:$mport/ && break; sleep 0.1; done
 start_app() {
     TORBOX_API_BASE=http://127.0.0.1:$mport/v1/api RD_API_BASE=http://127.0.0.1:$mport/rest/1.0 AD_API_BASE=http://127.0.0.1:$mport AD_DELAYED_POLL_MS=200 \
         TORBOX_UPDATE_URL=http://127.0.0.1:$mport/repos/x/torbox-ps5/releases/latest TORBOX_APP_DIR=$work/app TORBOX_DOWNLOADS=$work/dl \
-        TORBOX_ROOTS=$work TORBOX_PORT=$port TORBOX_LOW_SPEED_TIME=2 TORBOX_STALL_MS=4000 TORBOX_RETRY_MAX_MS=500 TORBOX_LEGACY_PORT=0 ${1+"$@"} "$bin" >> "$work/app.log" 2>&1 &
+        TORBOX_ROOTS=$work TORBOX_PORT=$port TORBOX_LOW_SPEED_TIME=2 TORBOX_STALL_MS=4000 TORBOX_RETRY_MAX_MS=500 TORBOX_LEGACY_PORT=0 \
+        TORBOX_SHSRV_PORT=$sport TORBOX_INSTALL_QUIET_MS=1500 TORBOX_INSTALL_STALL_MS=4000 ${1+"$@"} "$bin" >> "$work/app.log" 2>&1 &
     app_pid=$!
     pids+=($app_pid)
     for _ in $(seq 50); do curl -s "$base/api/status" > /dev/null && return; sleep 0.1; done
@@ -288,6 +293,38 @@ kill "$app_pid"; wait "$app_pid" 2>/dev/null || true
 start_app
 check "stream: same URL works after a restart" bash -c "curl -s -r 1048576-2097151 '$surl' | python3 -I -c 'import sys; d=sys.stdin.buffer.read(); sys.exit(0 if len(d)==1048576 and all(d[i]==(1048576+i)%251 for i in range(len(d))) else 1)'"
 check "stream: listed" bash -c "curl -s $base/api/streams | grep -q '\"requests\"'"
+
+# ---------- Stream Install (shsrv's pkg_install is played by tests/fake_shsrv.py) ----------
+ins_state() { get streams | jq_ "[x['install']+' '+x['status']+' '+x['content_id']+' '+x['error'] for x in d['streams'] if x['id']=='${1:0:8}'][0]"; }
+wait_install() { # token, wanted state prefix, seconds
+    for _ in $(seq $(($3 * 5))); do [[ $(ins_state "$1") == $2* ]] && return 0; sleep 0.2; done
+    return 1
+}
+for _ in $(seq 50); do (echo > /dev/tcp/127.0.0.1/$sport) 2>/dev/null && break; sleep 0.1; done
+r=$(post install -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((60 * 1048576))?drop=3000000" -d name=game.pkg)
+itok=$(jq_ 'd.get("token", "")' <<<"$r")
+check "install: started through shsrv" bash -c "test -n '$itok'"
+check "install: content id from shsrv" bash -c "[[ \$(get() { curl -s $base/api/\$1; }; get streams | grep -c TORBOXTESTPKG) -ge 1 ]]"
+check "install: delivered and marked installed" wait_install "$itok" installed 60
+check "install: the PS5's reads were exact" bash -c "grep -q '^game.pkg ok $((60 * 1048576))$' $work/installs.txt"
+r=$(post stream/remove -d id="${itok:0:8}")
+check "install: removed from the list" bash -c "! curl -s $base/api/streams | grep -q '${itok:0:8}'"
+r=$(post install -d kind=torrents -d id=101 -d file_id=0 -d name=movie.pkg)
+ttok=$(jq_ 'd.get("token", "")' <<<"$r")
+check "install: a TorBox file installs too" wait_install "$ttok" installed 60
+check "install: TorBox bytes exact" bash -c "grep -q '^movie.pkg ok $((60 * 1048576))$' $work/installs.txt"
+r=$(post install -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((80 * 1048576))" -d name=partial.pkg)
+ptok=$(jq_ 'd.get("token", "")' <<<"$r")
+check "install: a PS5 that stops pulling shows as failed" wait_install "$ptok" failed 60
+check "install: the failure says why" bash -c "curl -s $base/api/streams | grep -q 'stopped downloading the package'"
+kill $shsrv_pid; wait $shsrv_pid 2>/dev/null || true
+post install -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((8 * 1048576))" -d name=noshell.pkg > "$work/noshell.json"
+check "install: no shsrv gives a readable error" grep -q "shsrv, port $sport) is not running" "$work/noshell.json"
+python3 -I "$here/tests/fake_shsrv.py" $sport "$work/installs.txt" >> "$work/shsrv.log" 2>&1 &
+shsrv_pid=$!
+pids+=($shsrv_pid)
+r=$(post install -d kind=nope --data-urlencode "url=http://x/y.pkg")
+check "install: bad kind refused" bash -c "grep -q 'kind must be' <<<'$r'"
 
 # ---------- update check ----------
 r=$(get update)

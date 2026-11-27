@@ -9,6 +9,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 static pthread_mutex_t g_user_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_user_json[PROV_COUNT][1024]; // cached account summary per provider, "" = unknown
@@ -243,11 +245,39 @@ static void route_stream_create(http_req *r) {
     form_get(r->body, "url", url, 8192);
     sbuf b;
     sb_init(&b);
-    if (stream_create(kind, url, &b, err, sizeof err)) json_err(r->fd, 400, err);
+    if (stream_create(kind, url, NULL, &b, NULL, err, sizeof err)) json_err(r->fd, 400, err);
     else http_send_json(r->fd, 200, &b);
     memset(url, 0, 8192);
     free(url);
     sb_free(&b);
+}
+
+// Install a .pkg while it downloads: kind rd/ad/url with url=, or a TorBox kind with id= and file_id=; name=.
+static void route_install(http_req *r) {
+    char kind[16], id[32], file_id[32], name[256], err[300] = "";
+    char *url = malloc(8192);
+    if (!url) return;
+    form_get(r->body, "kind", kind, sizeof kind);
+    form_get(r->body, "url", url, 8192);
+    form_get(r->body, "id", id, sizeof id);
+    form_get(r->body, "file_id", file_id, sizeof file_id);
+    form_get(r->body, "name", name, sizeof name);
+    if (!strcmp(kind, "torrents") || !strcmp(kind, "webdl") || !strcmp(kind, "usenet"))
+        snprintf(url, 8192, "%lld:%lld", atoll(id), atoll(file_id));
+    sbuf b;
+    sb_init(&b);
+    if (stream_install(kind, url, name, &b, err, sizeof err)) json_err(r->fd, 400, err);
+    else http_send_json(r->fd, 200, &b);
+    memset(url, 0, 8192);
+    free(url);
+    sb_free(&b);
+}
+
+static void route_stream_remove(http_req *r) {
+    char id[64];
+    form_get(r->body, "id", id, sizeof id);
+    if (stream_remove(id)) json_err(r->fd, 409, "not possible while it runs");
+    else json_ok(r->fd);
 }
 
 static void route_streams(http_req *r) {
@@ -580,6 +610,8 @@ void api_handle(http_req *r) {
     else if (post && !strcmp(p, "download")) route_download(r);
     else if (post && !strcmp(p, "settings")) route_settings(r);
     else if (post && !strcmp(p, "stream")) route_stream_create(r);
+    else if (post && !strcmp(p, "install")) route_install(r);
+    else if (post && !strcmp(p, "stream/remove")) route_stream_remove(r);
     else if (get && !strcmp(p, "streams")) route_streams(r);
     else if (post && !strncmp(p, "jobs/", 5)) route_job_action(r, p + 5);
     else if (post && !strcmp(p, "quit")) {

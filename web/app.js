@@ -26,7 +26,8 @@ const hashProvider = location.hash.slice(1); // #torbox, #realdebrid or #alldebr
 const state = {
   provider: PROVIDERS[hashProvider] ? hashProvider : PROVIDERS[loadPref("provider", "")] ? loadPref("provider", "") : "torbox",
   tab: { torbox: "torrents", realdebrid: "rd-torrents", alldebrid: "ad-magnets" },
-  lists: {}, open: new Set(), rdInfo: {}, adFiles: {}, status: null, jobs: [], pollTimer: 0, updateChecked: false,
+  lists: {}, open: new Set(), rdInfo: {}, adFiles: {}, status: null, jobs: [], installs: [], served: {}, pollTimer: 0,
+  updateChecked: false,
 };
 
 function el(tag, props, ...children) {
@@ -298,6 +299,20 @@ async function queue(jobs) {
   pollJobs();
 }
 
+// ---------- installing packages while they download ----------
+const isPkg = (name) => /\.pkg$/i.test(String(name || ""));
+async function installPkg(spec, name) {
+  if (!confirm("Install " + name + " on the PS5?\n\nThe PS5 installs it while it downloads: no .pkg file is saved, " +
+      "only the installed game takes space. Progress shows in Downloads and on the PS5.")) return;
+  try {
+    await api("install", { ...spec, name });
+    toast("Installing " + name + " on the PS5");
+  } catch (e) { toast("Not started: " + e.message); }
+  pollJobs();
+}
+const installButton = (spec, name, enabled = true) => el("button", { class: "small", type: "button", disabled: !enabled,
+  title: "Install on the PS5 while it downloads (no .pkg file kept)", onclick: () => installPkg(spec, name) }, "Stream Install");
+
 function itemCard(title, metaParts, actions, extra) {
   return el("div", { class: "item" },
     el("div", { class: "item-name" }, title || "(no name)"),
@@ -331,8 +346,11 @@ function renderItem(it) {
       onclick: () => queue(files.map((f) => fileJob(f, true))) }, files.length > 1 ? "Download all files" : "Download"),
     files.length > 1 ? el("button", { class: "small", type: "button", disabled: !st.ready,
       onclick: () => queue([{ kind: tab, id: it.id, file_id: "", name: (it.name || "download") + ".zip" }]) }, "As one ZIP") : null,
+    files.length === 1 && isPkg(files[0].name) ? installButton({ kind: tab, id: it.id, file_id: files[0].id },
+      files[0].short_name || baseOf(files[0].name), st.ready) : null,
   ], open ? el("ul", { class: "files" }, files.map((f) => el("li", {},
     el("span", { class: "fname" }, f.short_name || f.name), el("span", { class: "fsize" }, size(f.size)),
+    isPkg(f.name) ? installButton({ kind: tab, id: it.id, file_id: f.id }, f.short_name || baseOf(f.name), st.ready) : null,
     el("button", { class: "small", type: "button", disabled: !st.ready, onclick: () => queue([fileJob(f, false)]) }, "Download")))) : null);
 }
 
@@ -374,6 +392,7 @@ function renderRdTorrent(t) {
   if (open && info) {
     const rows = info.files.map((f) => el("li", {},
       el("span", { class: "fname" }, String(f.path).replace(/^\//, "")), el("span", { class: "fsize" }, size(f.bytes)),
+      info.paired && isPkg(f.path) ? installButton({ kind: "rd", url: f.link }, baseOf(f.path), ready && !!f.link) : null,
       info.paired ? el("button", { class: "small", type: "button", disabled: !ready || !f.link,
         onclick: () => queue(rdJobs(info, [f], false)) }, "Download") : null));
     extra = el("div", {}, el("ul", { class: "files" }, rows),
@@ -390,6 +409,7 @@ function renderRdTorrent(t) {
     el("button", { class: "small", type: "button", onclick: toggle }, open ? "Hide files" : "Show files"),
     el("button", { class: "small primary", type: "button", disabled: !ready || !(t.links || []).length, onclick: all },
       (t.links || []).length > 1 ? "Download all files" : "Download"),
+    isPkg(t.filename) && (t.links || []).length === 1 ? installButton({ kind: "rd", url: t.links[0] }, t.filename, ready) : null,
   ], extra);
 }
 
@@ -400,6 +420,7 @@ function renderRdHistory(d) {
   ], [
     el("button", { class: "small primary", type: "button", disabled: !d.link,
       onclick: () => queue([{ kind: "rd", url: d.link, name: d.filename || "" }]) }, "Download"),
+    isPkg(d.filename) && d.link ? installButton({ kind: "rd", url: d.link }, d.filename) : null,
   ]);
 }
 
@@ -443,6 +464,7 @@ function renderAdMagnet(m) {
   };
   const extra = open && files ? el("ul", { class: "files" }, files.map((f) => el("li", {},
     el("span", { class: "fname" }, f.path), el("span", { class: "fsize" }, size(f.size)),
+    isPkg(f.path) ? installButton({ kind: "ad", url: f.link }, baseOf(f.path), ready && !!f.link) : null,
     el("button", { class: "small", type: "button", disabled: !ready || !f.link, onclick: () => queue(adJobs(m, files, [f], false)) }, "Download")))) : null;
   return itemCard(m.filename, [
     el("span", { class: "state " + (ready ? "ready" : bad ? "bad" : "busy") }, stText), el("span", {}, size(m.size)),
@@ -460,11 +482,13 @@ function renderAdLink(d) {
   ], [
     el("button", { class: "small primary", type: "button", disabled: !d.link,
       onclick: () => queue([{ kind: "ad", url: d.link, name: d.filename || "" }]) }, "Download"),
+    isPkg(d.filename) && d.link ? installButton({ kind: "ad", url: d.link }, d.filename) : null,
   ]);
 }
 
 function updateBadge() {
-  const active = state.jobs.filter((j) => ["queued", "starting", "downloading"].includes(j.state)).length;
+  const active = state.jobs.filter((j) => ["queued", "starting", "downloading"].includes(j.state)).length +
+    state.installs.filter((s) => ["starting", "installing"].includes(s.install)).length;
   const badge = $("#badge");
   if (badge) { badge.textContent = active; badge.classList.toggle("hidden", !active); }
   return active;
@@ -474,8 +498,16 @@ function updateBadge() {
 async function pollJobs() {
   clearTimeout(state.pollTimer);
   try {
-    const r = await api("jobs");
+    const [r, st] = await Promise.all([api("jobs"), api("streams").catch(() => ({ streams: [] }))]);
     state.jobs = r.jobs;
+    const now = Date.now();
+    state.installs = (st.streams || []).filter((s) => s.install).map((s) => {
+      const prev = state.served[s.id]; // speed from the bytes the installer pulled since the last poll
+      s.speed = prev && now > prev.t && s.served >= prev.b ? (s.served - prev.b) * 1000 / (now - prev.t) : 0;
+      if (prev && s.speed === 0 && s.active && prev.speed) s.speed = prev.speed * 0.5;
+      state.served[s.id] = { t: now, b: s.served, speed: s.speed };
+      return s;
+    });
     $("#connections").value = String(r.connections);
     $("#parallel").value = String(r.parallel);
     if (!$("#connections").value) $("#connections").append(el("option", {}, String(r.connections))), $("#connections").value = String(r.connections);
@@ -489,10 +521,36 @@ function jobAction(action, id) {
   return api("jobs/" + action, { id }).then(pollJobs).catch((e) => toast(e.message));
 }
 
+function renderInstall(s) {
+  const running = s.install === "starting" || s.install === "installing";
+  const pct = s.size > 0 ? Math.min(100, (s.served / s.size) * 100) : 0;
+  const parts = [];
+  if (s.size > 0) parts.push(size(s.served) + " of " + size(s.size) + " (" + pct.toFixed(1) + "%)");
+  if (running && s.speed > 0) parts.push(size(s.speed) + "/s");
+  if (running && s.speed > 0 && s.size > s.served) parts.push(duration((s.size - s.served) / s.speed) + " left");
+  if (s.install === "installed" && s.ins_time_s > 0) parts.push("in " + duration(s.ins_time_s));
+  const label = { starting: "starting the installer", installing: "installing", installed: "installed", failed: "failed" }[s.install];
+  const quiet = running && s.report_age_s > 60;
+  return el("div", { class: "item job install " + s.install },
+    el("div", { class: "item-name" }, s.name),
+    el("div", { class: "meta" },
+      el("span", { class: "state " + (s.install === "installed" ? "ready" : s.install === "failed" ? "bad" : "busy") }, label),
+      el("span", {}, "Stream Install"), parts.length ? el("span", {}, parts.join(" · ")) : null),
+    el("div", { class: "bar" }, el("div", { style: "width:" + (s.install === "installed" ? 100 : pct) + "%" })),
+    s.content_id ? el("div", { class: "meta" }, el("code", {}, s.content_id)) : null,
+    s.error ? el("div", { class: "error small" }, s.error) : null,
+    quiet ? el("div", { class: "muted small" }, "The PS5 has not pulled any data for " + duration(s.report_age_s) +
+      ": check Downloads on the PS5.") : null,
+    running ? el("div", { class: "muted small" }, "To cancel, use the download list on the PS5.") : null,
+    el("div", { class: "actions" }, !running ? el("button", { class: "small", type: "button",
+      onclick: () => api("stream/remove", { id: s.id }).then(pollJobs).catch((e) => toast(e.message)) }, "Remove from list") : null));
+}
+
 function renderJobs() {
   const jobs = state.jobs.slice().reverse();
-  $("#jobs-empty").classList.toggle("hidden", jobs.length > 0);
-  $("#jobs").replaceChildren(...jobs.map((j) => {
+  const installs = state.installs.slice().sort((a, b) => a.ins_age_s - b.ins_age_s);
+  $("#jobs-empty").classList.toggle("hidden", jobs.length + installs.length > 0);
+  $("#jobs").replaceChildren(...installs.map(renderInstall), ...jobs.map((j) => {
     const pct = j.total > 0 ? Math.min(100, (j.done / j.total) * 100) : 0;
     const running = j.state === "downloading";
     const parts = [];

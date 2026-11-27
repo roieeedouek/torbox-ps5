@@ -15,7 +15,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/statvfs.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -25,8 +27,8 @@
 
 typedef struct {
     char token[33];
-    char kind[8];
-    char *link;   // hoster link (rd/ad) or the direct URL (url)
+    char kind[12]; // rd, ad, url, or TorBox's torrents/webdl/usenet (link "item:file")
+    char *link;    // hoster link (rd/ad), "item:file" (TorBox) or the direct URL (url)
     char *direct; // current direct link, memory only
     char name[256];
     int64_t size, served, created_ms, last_ms;
@@ -35,9 +37,18 @@ typedef struct {
     struct rablock *win;
     int64_t base;
     int64_t pos[4]; // where the installer's open requests are reading, -1 = free
-    int ra_running;
+    int ra_running, ra_quit; // ra_quit: asked to stop (the stream is being removed)
     pthread_cond_t cv;
+    // Install through the helper (helper/installer.c), when the stream was made for one.
+    int ins; // 0 none, 1 starting, 2 installing (the PS5 pulls the package), 3 done, 4 failed
+    char ins_status[24], ins_err[200], content_id[48];
+    int64_t ins_done, ins_total, ins_started_ms, ins_finished_ms, ins_report_ms;
 } stream_t;
+
+static const char *ins_names[] = {"", "starting", "installing", "installed", "failed"};
+
+static pthread_once_t g_monitor_once = PTHREAD_ONCE_INIT;
+static void start_monitor(void); // finishes installs (defined with the install code below)
 
 static stream_t g_streams[MAX_STREAMS];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -51,8 +62,9 @@ static void save_streams_locked(void) {
     for (int i = 0; i < MAX_STREAMS; i++) {
         stream_t *s = &g_streams[i];
         if (s->token[0]) // hoster links only, like queue.tsv: never the direct link
-            fprintf(f, "%s\t%s\t%lld\t%lld\t%s\t%s\n", s->token, s->kind, (long long)s->size,
-                    (long long)s->last_ms, s->name, s->link ? s->link : "");
+            fprintf(f, "%s\t%s\t%lld\t%lld\t%s\t%s\t%d\t%s\n", s->token, s->kind, (long long)s->size,
+                    (long long)s->last_ms, s->name, s->link ? s->link : "", s->ins,
+                    s->content_id[0] ? s->content_id : "-");
     }
     fclose(f);
     rename(tmp, path);
@@ -70,9 +82,9 @@ void stream_init(void) {
     pthread_mutex_lock(&g_lock);
     while (line && n < MAX_STREAMS && fgets(line, 16384, f)) {
         line[strcspn(line, "\r\n")] = 0;
-        char *field[6];
+        char *field[8];
         int k = 0;
-        for (char *p = line, *save; k < 6 && (field[k] = strtok_r(k ? NULL : p, "\t", &save)); k++) {}
+        for (char *p = line, *save; k < 8 && (field[k] = strtok_r(k ? NULL : p, "\t", &save)); k++) {}
         if (k < 6 || strlen(field[0]) != 32) continue;
         stream_t *s = &g_streams[n++];
         memset(s, 0, sizeof *s);
@@ -84,11 +96,21 @@ void stream_init(void) {
         snprintf(s->name, sizeof s->name, "%s", field[4]);
         s->link = strdup(field[5]);
         s->created_ms = s->last_ms = plat_now_ms();
+        s->ins = k > 6 ? atoi(field[6]) : 0;
+        if (k > 7 && strcmp(field[7], "-")) snprintf(s->content_id, sizeof s->content_id, "%s", field[7]);
+        if (s->ins == 1) { // the helper never picked it up before the restart
+            s->ins = 4;
+            snprintf(s->ins_err, sizeof s->ins_err, "the server restarted before the install started: try again");
+        }
+        s->ins_report_ms = plat_now_ms(); // an install in progress keeps reporting to the new server
     }
     pthread_mutex_unlock(&g_lock);
     free(line);
     fclose(f);
     if (n) plat_log("streams: %d restored", n);
+    int running = 0;
+    for (int i = 0; i < n; i++) running |= g_streams[i].ins == 2;
+    if (running) pthread_once(&g_monitor_once, start_monitor); // an install in progress keeps going
 }
 
 static int server_port(void) {
@@ -111,10 +133,22 @@ static void make_token(char out[33]) {
     for (int i = 0; i < 16; i++) snprintf(out + 2 * i, 3, "%02x", r[i]);
 }
 
-// kind "rd"/"ad": unrestrict the hoster link; "url": use it as it is. 0 on success.
+static int is_tb_kind(const char *kind) {
+    return !strcmp(kind, "torrents") || !strcmp(kind, "webdl") || !strcmp(kind, "usenet");
+}
+
+// kind "rd"/"ad": unrestrict the hoster link; TorBox kinds: request a link for "item:file"; "url": as it is.
 static int resolve(const char *kind, const char *link, char *direct, size_t dlen, char *name, size_t nlen, char *err,
                    size_t errlen) {
     int permanent = 0, chunks = 0;
+    if (is_tb_kind(kind)) {
+        long long item = -1, file = -1;
+        if (sscanf(link, "%lld:%lld", &item, &file) != 2) {
+            snprintf(err, errlen, "bad TorBox file");
+            return -1;
+        }
+        return tb_request_link(kind, item, file, direct, dlen, err, errlen);
+    }
     if (!strcmp(kind, "rd")) return rd_unrestrict(link, direct, dlen, name, nlen, &chunks, &permanent, err, errlen);
     if (!strcmp(kind, "ad")) return ad_unlock(link, direct, dlen, name, nlen, &permanent, err, errlen);
     snprintf(direct, dlen, "%s", link);
@@ -170,12 +204,13 @@ static int64_t remote_size(const char *url, char *err, size_t errlen) {
     return s.total;
 }
 
-int stream_create(const char *kind, const char *link, sbuf *out, char *err, size_t errlen) {
-    if (strcmp(kind, "rd") && strcmp(kind, "ad") && strcmp(kind, "url")) {
-        snprintf(err, errlen, "kind must be rd, ad or url");
+int stream_create(const char *kind, const char *link, const char *name_hint, sbuf *out, char *token_out, char *err,
+                  size_t errlen) {
+    if (strcmp(kind, "rd") && strcmp(kind, "ad") && strcmp(kind, "url") && !is_tb_kind(kind)) {
+        snprintf(err, errlen, "kind must be rd, ad, url, torrents, webdl or usenet");
         return -1;
     }
-    if (strncmp(link, "http://", 7) && strncmp(link, "https://", 8)) {
+    if (!is_tb_kind(kind) && strncmp(link, "http://", 7) && strncmp(link, "https://", 8)) {
         snprintf(err, errlen, "the link must start with http:// or https://");
         return -1;
     }
@@ -191,7 +226,8 @@ int stream_create(const char *kind, const char *link, sbuf *out, char *err, size
         free(direct);
         return -1;
     }
-    if (!name[0]) { // the last path part of the link
+    if (name_hint && name_hint[0]) snprintf(name, sizeof name, "%s", name_hint);
+    if (!name[0] && !is_tb_kind(kind)) { // the last path part of the link
         const char *q = strstr(link, "://");
         const char *path = q ? strchr(q + 3, '/') : NULL;
         if (path) {
@@ -215,7 +251,8 @@ int stream_create(const char *kind, const char *link, sbuf *out, char *err, size
             slot = s;
             break;
         }
-        if (!s->active && !s->ra_running && (!slot || s->last_ms < slot->last_ms)) slot = s; // the oldest idle one
+        if (!s->active && !s->ra_running && s->ins != 1 && s->ins != 2 && (!slot || s->last_ms < slot->last_ms))
+            slot = s; // the oldest idle one, never a running install
     }
     if (!slot) {
         pthread_mutex_unlock(&g_lock);
@@ -240,6 +277,7 @@ int stream_create(const char *kind, const char *link, sbuf *out, char *err, size
     save_streams_locked();
     pthread_mutex_unlock(&g_lock);
 
+    if (token_out) snprintf(token_out, 33, "%s", token);
     char ename[800], ip[64];
     url_encode(name, ename, sizeof ename);
     plat_local_ip(ip, sizeof ip);
@@ -528,7 +566,7 @@ static void ra_drop(CURLM *m, struct rablock *bl) {
 
 static void *ra_thread(void *arg) {
     stream_t *s = arg;
-    char tok[33], kind[8];
+    char tok[33], kind[12];
     pthread_mutex_lock(&g_lock);
     snprintf(tok, sizeof tok, "%s", s->token);
     snprintf(kind, sizeof kind, "%s", s->kind);
@@ -548,7 +586,7 @@ static void *ra_thread(void *arg) {
     while (win && m && link) {
         int64_t now = plat_now_ms();
         pthread_mutex_lock(&g_lock);
-        if (strcmp(s->token, tok)) {
+        if (strcmp(s->token, tok) || s->ra_quit) {
             pthread_mutex_unlock(&g_lock);
             break;
         }
@@ -761,7 +799,7 @@ void stream_handle(http_req *r) {
         http_send(r->fd, 404, "text/plain", "not found", 9, NULL);
         return;
     }
-    char tok[33], kind[8];
+    char tok[33], kind[12];
     memcpy(tok, p, 32);
     tok[32] = 0;
     pthread_mutex_lock(&g_lock);
@@ -863,18 +901,246 @@ out:;
     pthread_mutex_unlock(&g_lock);
 }
 
+// ---------- installing: shsrv starts it, a monitor finishes it from the stream's progress ----------
+//
+// The system installer (sceAppInstUtilInstallByPackage) only works from a process spawned into a system image, as
+// shsrv's `pkg_install` does; the same call from this payload is refused (PlayGo 0x80B2116F). So the server asks
+// shsrv, on the console's shell port, to start the install pointed at our stream URL, and reads back the content id
+// it prints. The PS5 then pulls the package from the stream; a monitor thread marks the install done when the whole
+// package has been delivered, or failed if the PS5 stops pulling it.
+
+#define SHSRV_PORT 2323
+
+// Sends "pkg_install <url>" to shsrv and reads the content id it prints. 0 if shsrv accepted the command.
+static int shsrv_start(const char *url, char *content_id, size_t cidlen, char *err, size_t errlen) {
+    content_id[0] = 0;
+    int port = SHSRV_PORT;
+#ifndef __PROSPERO__
+    const char *env = getenv("TORBOX_SHSRV_PORT"); // host tests run a fake shsrv
+    if (env && atoi(env) > 0) port = atoi(env);
+#endif
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons((unsigned short)port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (sock < 0 || connect(sock, (struct sockaddr *)&a, sizeof a)) {
+        if (sock >= 0) close(sock);
+        snprintf(err, errlen, "the console's shell server (shsrv, port %d) is not running", port);
+        return -1;
+    }
+    char cmd[4200];
+    int n = snprintf(cmd, sizeof cmd, "pkg_install %s\nexit\n", url);
+    if (http_send_raw(sock, cmd, (size_t)n)) {
+        close(sock);
+        snprintf(err, errlen, "could not talk to shsrv");
+        return -1;
+    }
+    // Read until the shell closes or the content id appears. shsrv prints "... content_id = [ID] ..." then returns.
+    char buf[8192];
+    size_t got = 0;
+    int64_t t0 = plat_now_ms();
+    while (got + 1 < sizeof buf && plat_now_ms() - t0 < 30000) {
+        struct pollfd pfd = {sock, POLLIN, 0};
+        if (poll(&pfd, 1, 1000) <= 0) {
+            if (strstr(buf, "content_id")) break;
+            continue;
+        }
+        ssize_t r = recv(sock, buf + got, sizeof buf - 1 - got, 0);
+        if (r <= 0) break;
+        got += (size_t)r;
+        buf[got] = 0;
+        if (strstr(buf, "content_id")) break;
+    }
+    close(sock);
+    const char *p = strstr(buf, "content_id = [");
+    if (p) {
+        p += 14;
+        size_t k = strcspn(p, "]");
+        if (k && k < cidlen) {
+            memcpy(content_id, p, k);
+            content_id[k] = 0;
+        }
+    }
+    if (strstr(buf, "command not found") || strstr(buf, "not found")) {
+        snprintf(err, errlen, "this shsrv build has no pkg_install command");
+        return -1;
+    }
+    return 0; // the command was sent; the install proceeds even if no content id was parsed
+}
+
+// Finishes installs the shell started: done once the whole package has been pulled, failed if the PS5 stops pulling.
+static void *monitor_thread(void *arg) {
+    (void)arg;
+    int64_t quiet_done = 8000, quiet_stall = 180000; // after the last request: delivered / stopped
+#ifndef __PROSPERO__
+    const char *env = getenv("TORBOX_INSTALL_QUIET_MS"); // host tests
+    if (env && atoi(env) > 0) quiet_done = atoi(env);
+    env = getenv("TORBOX_INSTALL_STALL_MS");
+    if (env && atoi(env) > 0) quiet_stall = atoi(env);
+#endif
+    for (;;) {
+        plat_sleep_ms(quiet_done < 3000 ? 500 : 3000);
+        pthread_mutex_lock(&g_lock);
+        int64_t now = plat_now_ms();
+        for (int i = 0; i < MAX_STREAMS; i++) {
+            stream_t *s = &g_streams[i];
+            if (s->ins != 2) continue;
+            s->ins_done = s->served;
+            s->ins_total = s->size;
+            if (s->active) s->ins_report_ms = now; // the PS5 is pulling: that is its news
+            else if (s->last_ms > s->ins_report_ms) s->ins_report_ms = s->last_ms;
+            int delivered = s->size > 0 && s->served >= s->size;
+            int64_t quiet = now - (s->last_ms > s->ins_started_ms ? s->last_ms : s->ins_started_ms);
+            if (delivered && !s->active && quiet > quiet_done) {
+                s->ins = 3;
+                s->ins_finished_ms = now;
+                snprintf(s->ins_status, sizeof s->ins_status, "delivered");
+                save_streams_locked();
+                plat_log("install %.8s: delivered %s (%lld bytes)", s->token, s->name, (long long)s->served);
+            } else if (!delivered && !s->active && quiet > quiet_stall) {
+                s->ins = 4;
+                s->ins_finished_ms = now;
+                snprintf(s->ins_err, sizeof s->ins_err,
+                         "the PS5 stopped downloading the package at %lld of %lld bytes", (long long)s->served,
+                         (long long)s->size);
+                save_streams_locked();
+                plat_log("install %.8s: stalled at %lld/%lld", s->token, (long long)s->served, (long long)s->size);
+            }
+        }
+        pthread_mutex_unlock(&g_lock);
+    }
+    return NULL;
+}
+
+static void start_monitor(void) { plat_start_thread(monitor_thread, NULL); }
+
+int stream_install(const char *kind, const char *link, const char *name, sbuf *out, char *err, size_t errlen) {
+    sbuf tmp;
+    sb_init(&tmp);
+    char token[33] = "";
+    int rc = stream_create(kind, link, name, &tmp, token, err, errlen);
+    sb_free(&tmp);
+    if (rc) return -1;
+    pthread_mutex_lock(&g_lock);
+    stream_t *s = NULL;
+    for (int i = 0; i < MAX_STREAMS; i++)
+        if (!strcmp(g_streams[i].token, token)) s = &g_streams[i];
+    if (!s) {
+        pthread_mutex_unlock(&g_lock);
+        snprintf(err, errlen, "stream lost");
+        return -1;
+    }
+    int64_t size = s->size;
+    char ename[800], url[4200];
+    url_encode(s->name, ename, sizeof ename);
+    pthread_mutex_unlock(&g_lock);
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/stream/%s/%s", server_port(), token, ename);
+
+    // The game needs about its package's size, plus the reserve the internal storage keeps while writing.
+    struct statvfs vs;
+    if (!statvfs("/user", &vs)) {
+        double free_b = (double)vs.f_bavail * vs.f_frsize, need = size * 1.2;
+        if (free_b < need) {
+            snprintf(err, errlen, "not enough space on the console: about %.1f GB needed, %.1f GB free", need / 1e9,
+                     free_b / 1e9);
+            pthread_mutex_lock(&g_lock);
+            s->ins = 4;
+            snprintf(s->ins_err, sizeof s->ins_err, "%s", err);
+            s->ins_finished_ms = plat_now_ms();
+            save_streams_locked();
+            pthread_mutex_unlock(&g_lock);
+            return -1;
+        }
+    }
+    pthread_mutex_lock(&g_lock);
+    s->ins = 1;
+    s->ins_started_ms = s->ins_report_ms = s->last_ms = plat_now_ms();
+    save_streams_locked();
+    pthread_mutex_unlock(&g_lock);
+    plat_log("install %.8s: %s, %lld bytes", token, s->name, (long long)size);
+
+    char cid[48] = "";
+    if (shsrv_start(url, cid, sizeof cid, err, errlen)) {
+        plat_log("install %.8s: not started: %s", token, err);
+        pthread_mutex_lock(&g_lock);
+        s->ins = 4;
+        snprintf(s->ins_err, sizeof s->ins_err, "%s", err);
+        s->ins_finished_ms = plat_now_ms();
+        save_streams_locked();
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+    pthread_once(&g_monitor_once, start_monitor);
+    pthread_mutex_lock(&g_lock);
+    s->ins = 2;
+    s->ins_report_ms = s->last_ms = plat_now_ms();
+    if (cid[0]) snprintf(s->content_id, sizeof s->content_id, "%s", cid);
+    snprintf(s->ins_status, sizeof s->ins_status, "downloading");
+    save_streams_locked();
+    pthread_mutex_unlock(&g_lock);
+    plat_log("install %.8s: started by shsrv%s%s", token, cid[0] ? ", content id " : "", cid);
+    sb_printf(out, "{\"ok\":true,\"token\":\"%s\"}", token);
+    return 0;
+}
+
+// Removes a finished or failed install (or a plain stream) from the list.
+int stream_remove(const char *id) {
+    pthread_mutex_lock(&g_lock);
+    int rc = -1;
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        stream_t *s = &g_streams[i];
+        if (!s->token[0] || strncmp(s->token, id, strlen(id)) || strlen(id) < 8) continue;
+        if (s->active || s->ins == 1 || s->ins == 2) break;
+        s->ra_quit = 1; // the read-ahead thread idles a while after the last request: stop it first
+        for (int w = 0; s->ra_running && w < 50; w++) {
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            struct timespec ts = {tv.tv_sec, (tv.tv_usec + 100000L) * 1000L};
+            if (ts.tv_nsec >= 1000000000L) ts.tv_sec++, ts.tv_nsec -= 1000000000L;
+            pthread_cond_timedwait(&s->cv, &g_lock, &ts);
+        }
+        if (s->ra_running) {
+            s->ra_quit = 0;
+            break;
+        }
+        free(s->link);
+        if (s->direct) memset(s->direct, 0, strlen(s->direct)), free(s->direct);
+        pthread_cond_destroy(&s->cv);
+        memset(s, 0, sizeof *s);
+        save_streams_locked();
+        rc = 0;
+        break;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return rc;
+}
+
 void stream_list_json(sbuf *out) {
     pthread_mutex_lock(&g_lock);
+    int64_t now = plat_now_ms();
     sb_puts(out, "{\"ok\":true,\"streams\":[");
     int first = 1;
     for (int i = 0; i < MAX_STREAMS; i++) {
         stream_t *s = &g_streams[i];
         if (!s->token[0]) continue;
         sb_printf(out, "%s{\"id\":\"%.8s\",\"kind\":\"%s\",\"size\":%lld,\"served\":%lld,\"requests\":%d,\"active\":%d,"
-                       "\"idle_s\":%lld,\"name\":",
+                       "\"idle_s\":%lld,\"install\":\"%s\",\"ins_done\":%lld,\"ins_total\":%lld,"
+                       "\"ins_age_s\":%lld,\"report_age_s\":%lld,\"ins_time_s\":%lld,\"name\":",
                   first ? "" : ",", s->token, s->kind, (long long)s->size, (long long)s->served, s->requests, s->active,
-                  (long long)((plat_now_ms() - s->last_ms) / 1000));
+                  (long long)((now - s->last_ms) / 1000), ins_names[s->ins], (long long)s->ins_done,
+                  (long long)s->ins_total, s->ins ? (long long)((now - s->ins_started_ms) / 1000) : -1,
+                  s->ins ? (long long)((now - s->ins_report_ms) / 1000) : -1,
+                  s->ins_finished_ms > s->ins_started_ms ? (long long)((s->ins_finished_ms - s->ins_started_ms) / 1000)
+                                                         : -1);
         sb_json_str(out, s->name);
+        sb_puts(out, ",\"status\":");
+        sb_json_str(out, s->ins_status);
+        sb_puts(out, ",\"error\":");
+        sb_json_str(out, s->ins_err);
+        sb_puts(out, ",\"content_id\":");
+        sb_json_str(out, s->content_id);
         sb_puts(out, "}");
         first = 0;
     }

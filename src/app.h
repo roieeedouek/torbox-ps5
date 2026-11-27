@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define APP_VERSION "1.1.2"
+#define APP_VERSION "1.2.0"
 #define APP_TITLE_ID "PPSA97630"
 #define APP_REPO "roieeedouek/torbox-ps5" // GitHub repository whose releases the update check reads
 #define APP_PORT 8089
@@ -174,8 +174,13 @@ int http_send_raw(int fd, const void *data, size_t len); // 0 = all sent
 void api_handle(http_req *req);
 
 // ---- streaming to the PS5 package installer (stream.c) ----
-// Makes a link servable at /stream/<token>/<name> (kind "rd", "ad" or "url"); out gets the stream as JSON.
-int stream_create(const char *kind, const char *link, sbuf *out, char *err, size_t errlen);
+// Makes a link servable at /stream/<token>/<name> (kind rd, ad, url, or a TorBox kind with link "item:file");
+// name may be NULL (the provider's or the link's name). out gets the stream as JSON, token_out (33) its token.
+int stream_create(const char *kind, const char *link, const char *name, sbuf *out, char *token_out, char *err,
+                  size_t errlen);
+// Streams the file into the PS5 installer: a stream, started through shsrv's pkg_install (port 2323).
+int stream_install(const char *kind, const char *link, const char *name, sbuf *out, char *err, size_t errlen);
+int stream_remove(const char *id); // a finished/failed install or idle stream, by token or its first 8 characters
 void stream_handle(http_req *req); // GET/HEAD /stream/<token>/...
 void stream_list_json(sbuf *out);
 void stream_init(void); // restores streams saved before a restart

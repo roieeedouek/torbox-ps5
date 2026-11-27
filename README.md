@@ -25,6 +25,7 @@ the TV: the home-screen tile opens it in the PS5's browser).
 - A TorBox download server that fails or stalls is replaced: the download asks TorBox for a fresh link and
   continues the partial file.
 - USB drives (`/mnt/usbN`, usually exFAT) are written strictly in order, which exFAT needs to stay fast.
+- *Stream Install* next to `.pkg` files: the PS5 installs the package while it downloads, without saving it.
 - *Logs* (at the bottom of the page) shows the event log: speeds, connections, disk writes and errors.
 - A link box: any direct `http(s)://` URL, or a hoster link unrestricted by Real-Debrid or unlocked by AllDebrid.
 - Update check: the page tells you when a newer release is out on GitHub (*Check for updates* at the bottom).
@@ -186,33 +187,31 @@ Measured on this console (fw 13.60) on the owner's network:
   `http://<console-ip>:8089/api/speedtest?mb=200` on a PC on the same network: it streams 200 MB from the
   console (a PC on Wi-Fi limits this test too). A wired console is the safest bet.
 
-## Experimental: install a package while it downloads
+## Stream Install: install a .pkg while it downloads
 
-The server can offer a TorBox, Real-Debrid or AllDebrid file at a local address that the PS5's own package
-installer reads from, so a `.pkg` is installed straight from the provider and never stored on the console (only
-the installed game takes space). There is no button in the page yet; it is driven through the API and the
-`pkg_install` command of shsrv (the shell server on port 2323):
+Next to every `.pkg` file in the lists (TorBox, Real-Debrid, AllDebrid) there is a **Stream Install** button. The
+PS5's own package installer then reads the package straight from the provider, through this server, while it
+installs: no `.pkg` file is saved on the console, so only the installed game takes space. The install shows in
+*Downloads* with its progress, speed and result; it also shows in the PS5's own download list (cancel it there).
 
-```sh
-# 1. make a stream (kind rd, ad or url; url = the provider's hoster/file link)
-curl -H 'X-TorBox-PS5: 1' -d kind=rd --data-urlencode 'url=https://real-debrid.com/d/...' \
-     http://<console-ip>:8089/api/stream          # -> {"url": "http://127.0.0.1:8089/stream/<token>/<name>.pkg", ...}
-# 2. start the install on the console with that URL
-printf 'pkg_install http://127.0.0.1:8089/stream/<token>/<name>.pkg\nexit\n' | nc <console-ip> 2323
-```
-
+- **Needs shsrv** (the shell server, port 2323) running on the console: the install is started with its
+  `pkg_install` command. The system installer only works from a process spawned into a system image, as shsrv does;
+  the same call from a payload is refused (PlayGo error 0x80B2116F). Without shsrv the button says so.
+- Packages must be fake packages the console accepts (PS5 ones need a current kstuff, and ShadowMount+ to play).
+  There must be room for about 1.2 times the package size (the internal storage keeps a reserve while writing).
 - The installer reads the package front to back in 18 MiB ranges, two at a time. The server reads ahead with up
-  to 16 connections into a window of up to 1 GiB (64 MiB blocks), and serves each block while it fills.
-  Real-Debrid closes every connection after one answer, so blocks are large to keep new connections few; connection
-  errors halve the number of connections for a while.
-- Measured on firmware 13.60 from Real-Debrid: a 15.7 GB game installed in about 2.5 minutes (107–126 MB/s, the
-  network's limit); a 42.5 GB game installed at 65–80 MB/s with the read-ahead window full, so there the installer
-  was the limit.
+  to 16 connections into a window of up to 1 GiB (64 MiB blocks) and serves each block while it fills. Real-Debrid
+  closes every connection after one answer, so blocks are large to keep new connections few; connection errors halve
+  the number of connections for a while.
+- Measured on firmware 13.60 from Real-Debrid: a 15.7 GB game installed in about 2.5 minutes (100–130 MB/s, the
+  network's limit); a 42.5 GB game at 65–80 MB/s with the read-ahead full, so there the installer was the limit.
 - Expired or dropped links are refreshed without the installer noticing. Streams are kept in
   `/data/torbox-ps5/streams.tsv` (hoster links, never direct links), so a server restart in the middle of an install
   is survived: the installer continues with the same address.
-- `GET /api/streams` shows each stream's size, bytes served and open requests.
-- Packages must be fake packages the console accepts (PS5 ones need a current kstuff, and ShadowMount+ to play).
+- The install counts as done once the PS5 has pulled the whole package, and as failed if it stops pulling for 3
+  minutes. The PS5's own list has the final word.
+- API: `POST /api/install` (kind `rd`/`ad`/`url` with `url=`, or a TorBox kind with `id=` and `file_id=`; `name=`),
+  `GET /api/streams`, `POST /api/stream/remove`. `POST /api/stream` alone makes a stream without installing.
 
 ## Files on the console
 
@@ -285,7 +284,8 @@ src/torbox.c     TorBox client
 src/realdebrid.c Real-Debrid client (rate limit, errors, file/link pairing, unrestrict)
 src/alldebrid.c  AllDebrid client (rate limit, errors, magnets and file trees, links, unlock with delayed links)
 src/update.c     update check against the repository's latest GitHub release
-src/stream.c     streaming a provider file to the PS5 package installer (read-ahead window, link refresh)
+src/stream.c     Stream Install: a provider file served to the PS5 package installer (read-ahead window,
+                 link refresh), started through shsrv's pkg_install, finished by a monitor
 src/dl.c         queue, downloads (curl_multi on one thread, connection control, TorBox link refresh, USB
                  in-order mode), resume, persistence
 src/writer.c     disk writer thread: merges 128 KiB blocks into writes of up to 2 MiB
