@@ -14,9 +14,11 @@
 </header>
 
 <main>
+  <div id="update" class="update hidden"></div>
   <nav id="providers" class="providers" aria-label="Service">
     <button type="button" data-provider="torbox">TorBox</button>
     <button type="button" data-provider="realdebrid">Real-Debrid</button>
+    <button type="button" data-provider="alldebrid">AllDebrid</button>
   </nav>
 
   <section id="login" class="card hidden">
@@ -58,7 +60,7 @@
           <label>Connections per file
             <select id="connections">
               <option value="0">Auto</option><option>1</option><option>2</option><option>4</option><option>6</option>
-              <option>8</option><option>12</option><option>16</option>
+              <option>8</option><option>12</option><option>16</option><option>24</option><option>32</option>
             </select>
           </label>
           <label>Files at a time
@@ -71,8 +73,12 @@
             <input id="url" type="url" placeholder="Or download a link (https://...)" spellcheck="false">
             <button type="submit">Add</button>
           </div>
-          <label id="url-rd-wrap" class="check hidden"><input id="url-rd" type="checkbox" checked>
-            Unrestrict with Real-Debrid (hoster links)</label>
+          <label id="url-via-wrap" class="check hidden">Hoster links:
+            <select id="url-via">
+              <option value="url">download directly</option>
+              <option value="rd">unrestrict with Real-Debrid</option>
+              <option value="ad">unlock with AllDebrid</option>
+            </select></label>
         </form>
       </div>
       <div id="jobs"></div>
@@ -82,6 +88,7 @@
     <footer class="foot">
       <span id="account" class="muted small"></span>
       <span class="grow"></span>
+      <button id="update-btn" type="button" class="link">Check for updates</button>
       <button id="logs-btn" type="button" class="link">Logs</button>
       <button id="logout" type="button" class="link">Log out</button>
       <button id="quit" type="button" class="link danger">Stop server</button>

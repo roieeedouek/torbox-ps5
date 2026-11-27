@@ -1,19 +1,22 @@
 # TorBox for PS5
 
-Browse your [TorBox](https://torbox.app) and [Real-Debrid](https://real-debrid.com) accounts and download their
+Browse your [TorBox](https://torbox.app), [Real-Debrid](https://real-debrid.com) and
+[AllDebrid](https://alldebrid.com) accounts and download their
 files **onto a jailbroken PS5**, from a web page you open on your phone or PC: `http://<console-ip>:8080` (or on
 the TV: the home-screen tile opens it in the PS5's browser).
 
-- Two services, switched at the top of the page, each with its own login (TorBox API key, Real-Debrid API token),
-  checked with the service and then stored on the console. Logging out of one keeps the other.
+- Three services, switched at the top of the page, each with its own login (TorBox API key, Real-Debrid API token,
+  AllDebrid API key), checked with the service and then stored on the console. Logging out of one keeps the others.
 - TorBox: torrents, web downloads and usenet lists with names, sizes, status and the files inside each item.
 - Real-Debrid: torrents (status, size, progress, files) and the download history. Hoster links are turned into
   direct links ("unrestricted") when a download starts.
+- AllDebrid: magnets (status, size, the files inside), saved links and recent links. Links are unlocked into
+  direct links when a download starts.
 - Download one file, all files of an item (folder structure kept), or the item as one ZIP, to a folder you choose:
   type it or pick it with the folder browser (`/data/...` and USB drives `/mnt/usbN`, `/mnt/extN`).
 - Progress bar, bytes, speed, time left, connections in use. Pause, resume, cancel, retry, a queue.
-- Up to 16 HTTP Range connections per file (*Auto* or a fixed 1 to 16), about 100 MB/s from TorBox on the
-  console. When a connection finishes its part it splits the largest remaining part, so all connections stay busy
+- Up to 32 HTTP Range connections per file (*Auto*, which goes up to 16, or a fixed 1 to 32), 50 to 100 MB/s
+  from TorBox and Real-Debrid on the console. When a connection finishes its part it splits the largest remaining part, so all connections stay busy
   until the end. *Auto* halves the connection count when the server pushes back (429, 5xx, timeouts) and grows it
   again when things settle.
 - Partial files resume: after a pause, an error, a network drop, a server restart or a console reboot, the download
@@ -23,7 +26,8 @@ the TV: the home-screen tile opens it in the PS5's browser).
   continues the partial file.
 - USB drives (`/mnt/usbN`, usually exFAT) are written strictly in order, which exFAT needs to stay fast.
 - *Logs* (at the bottom of the page) shows the event log: speeds, connections, disk writes and errors.
-- A link box: any direct `http(s)://` URL, or, with Real-Debrid, a hoster link it unrestricts.
+- A link box: any direct `http(s)://` URL, or a hoster link unrestricted by Real-Debrid or unlocked by AllDebrid.
+- Update check: the page tells you when a newer release is out on GitHub (*Check for updates* at the bottom).
 
 ## Screenshots
 
@@ -89,28 +93,32 @@ You need FTP access to the console (e.g. zftpd on port 2120 or 2121) and ShadowM
 **Without the title:** send the payload yourself: `cat torbox-ps5.elf > /dev/tcp/<console-ip>/9021` (Linux/WSL),
 or with any payload sender to port 9021.
 
-**Update:** press *Stop server* on the page, replace the files, start again. Downloads resume.
+**Update:** the page shows a notice when a newer release is out (the console asks the GitHub API for the
+latest release of this repository, at most every 6 hours; nothing about you or your accounts is sent). Press
+*Stop server* on the page, replace the files, start again. Downloads resume.
 
 ## Use
 
 1. On a phone or PC on the same network open `http://<console-ip>:8080`.
-2. Pick the service at the top (*TorBox* or *Real-Debrid*; a dot marks the ones you are logged in to; the address
-   `http://<console-ip>:8080/#realdebrid` opens Real-Debrid directly) and paste its key:
+2. Pick the service at the top (*TorBox*, *Real-Debrid* or *AllDebrid*; a dot marks the ones you are logged in
+   to; `http://<console-ip>:8080/#realdebrid` or `#alldebrid` opens one directly) and paste its key:
    - TorBox: the API key from torbox.app, Settings, API Key.
    - Real-Debrid: the private API token from <https://real-debrid.com/apitoken> (while logged in there).
+   - AllDebrid: an API key from <https://alldebrid.com/apikeys> (while logged in there).
 
    The key is checked with the service first (TorBox `user/me`, Real-Debrid `/user`, which also shows your account
-   type and premium expiry). It is stored **unencrypted** on the console (`/data/torbox-ps5/torbox-key.txt`,
-   `/data/torbox-ps5/realdebrid-token.txt`) and never sent back to the browser. *Log out* deletes that service's
+   type and premium expiry; AllDebrid `/v4/user`). It is stored **unencrypted** on the console
+   (`/data/torbox-ps5/torbox-key.txt`, `realdebrid-token.txt`, `alldebrid-key.txt`) and never sent back to the browser. *Log out* deletes that service's
    key only.
 3. TorBox: *Torrents*, *Web* or *Usenet*. Real-Debrid: *Torrents* (100 per page, *Load more* for the rest) or
-   *History* (your earlier unrestricted downloads). *Show files* lists a torrent's files. *Refresh* reloads.
+   *History* (your earlier unrestricted downloads). AllDebrid: *Magnets*, *Saved links* or *History*. *Show files*
+   lists a torrent's or magnet's files. *Refresh* reloads.
 4. Set *Save to* (default `/data/torbox-downloads`) or press *Browse* to pick or create a folder. The folder is
    remembered by your browser.
 5. *Download* (one file, saved directly in the folder), *Download all files* (into `<folder>/<item name>/...`), or
    *As one ZIP*. The *Downloads* tab shows the queue. Items still downloading on TorBox's side can't be
    downloaded yet.
-6. In *Downloads*: *Connections per file* (*Auto*, the default, or 1 to 16) and *Files at a time* apply to
+6. In *Downloads*: *Connections per file* (*Auto*, the default, or 1 to 32) and *Files at a time* apply to
    downloads that start (or resume) from then on. Pause, then Resume, to change the connections of a running
    download. *Remove from list* keeps a paused or failed download's partial file, so adding the file again
    continues it; *Cancel* deletes it.
@@ -133,6 +141,19 @@ or with any payload sender to port 9021.
   service): paste a hoster link and it is downloaded through Real-Debrid. Untick it for a plain direct link.
 - Not included: adding torrents or magnets, selecting files, and the OAuth device login. Do those on
   real-debrid.com.
+
+### AllDebrid details
+
+- A magnet's files come as a tree; *Download all files* keeps its folders (`<folder>/<magnet name>/...`). Each file
+  link is unlocked when its download starts; links the host needs time to prepare ("delayed") are waited for (up to
+  2 minutes). Direct links are kept in memory only, never on disk or in the log.
+- *History* lists recent links only when history is turned on in your AllDebrid account settings.
+- The app stays under AllDebrid's limits (12 requests a second, 600 a minute) and waits out HTTP 429/503. Errors are
+  shown as text, e.g. "bad API key", "a premium account is needed", "unsupported host", "file unavailable on the
+  host"; the ones a retry cannot fix stop the download at once.
+- A login from a new place can be blocked until you confirm it in the e-mail AllDebrid sends ("login blocked from
+  a new location").
+- Not included: adding magnets or links and the PIN login. Do those on alldebrid.com.
 
 ### Speed
 
@@ -157,6 +178,7 @@ Measured on this console (fw 13.60) on the owner's network:
 ```
 /data/torbox-ps5/torbox-key.txt        TorBox API key (unencrypted, mode 600)
 /data/torbox-ps5/realdebrid-token.txt  Real-Debrid API token (unencrypted, mode 600)
+/data/torbox-ps5/alldebrid-key.txt     AllDebrid API key (unencrypted, mode 600)
 /data/torbox-ps5/queue.tsv             unfinished downloads: ids, folders, and the hoster links of Real-Debrid
                                        downloads; never direct download links or keys
 /data/torbox-ps5/settings.txt     connections, files at a time
@@ -200,9 +222,11 @@ into the binary by `tools/embed.py`.
 
 `tests/mock_torbox.py` imitates the TorBox API (`user/me`, `*/mylist`, `*/requestdl`) and the Real-Debrid API
 (`/user`, paged `/torrents` with `X-Total-Count`, `/torrents/info`, `/downloads`, `/unrestrict/link`, direct links
-that expire, injected 429s), and serves test files with Range support, broken connections, throttling,
-connection limits, `Retry-After`, ETags, stalls and HTTP 400s. `tests/test_host.sh` covers both logins and
-logouts, lists and paging, file-to-link pairing, the folder browser, single and multi-connection downloads, resume
+that expire, injected 429s), the AllDebrid API (`/v4/user`, `/v4.1/magnet/status`, `/v4/magnet/files`, saved and
+recent links, `/v4/link/unlock` with a delayed link) and GitHub's latest-release call, and serves test files with
+Range support, broken connections, throttling, connection limits, `Retry-After`, ETags, stalls and HTTP 400s.
+`tests/test_host.sh` covers the three logins and logouts, lists and paging, AllDebrid file trees, delayed links
+and unsupported hosts, the update check (newer, same, older, no release), file-to-link pairing, the folder browser, single and multi-connection downloads, resume
 after pause and after a restart, an expired Real-Debrid link unrestricted again, connection splitting, HTTP 429
 limits, readable errors, TorBox link refresh after a stall or an HTTP 400, partial files kept when a server
 misbehaves, in-order USB writes with a slow disk, the log endpoint (no secrets in it), cancel, and checksums.
@@ -217,6 +241,8 @@ src/api.c        JSON API: status, login, logout, list, rd/*, dirs, mkdir, downl
 src/net.c        providers, key storage, HTTPS client (libcurl), socket tuning
 src/torbox.c     TorBox client
 src/realdebrid.c Real-Debrid client (rate limit, errors, file/link pairing, unrestrict)
+src/alldebrid.c  AllDebrid client (rate limit, errors, magnets and file trees, links, unlock with delayed links)
+src/update.c     update check against the repository's latest GitHub release
 src/dl.c         queue, downloads (curl_multi on one thread, connection control, TorBox link refresh, USB
                  in-order mode), resume, persistence
 src/writer.c     disk writer thread: merges 128 KiB blocks into writes of up to 2 MiB
@@ -230,6 +256,10 @@ APIs used:
   `GET /v1/api/{torrents,webdl,usenet}/requestdl?token=...&{torrent_id|web_id|usenet_id}=...&file_id=...|zip_link=true`.
 - Real-Debrid (`https://api.real-debrid.com/rest/1.0`, `Authorization: Bearer <token>`): `GET /user`,
   `GET /torrents?page=&limit=`, `GET /torrents/info/{id}`, `GET /downloads?page=&limit=`, `POST /unrestrict/link`.
+- AllDebrid (`https://api.alldebrid.com`, `Authorization: Bearer <key>`): `GET /v4/user`, `POST /v4.1/magnet/status`,
+  `POST /v4/magnet/files` (`id[]`), `GET /v4/user/links`, `GET /v4/user/history`, `POST /v4/link/unlock`,
+  `POST /v4/link/delayed`.
+- GitHub: `GET https://api.github.com/repos/roieeedouek/torbox-ps5/releases/latest` (update check).
 
 ## Credits
 

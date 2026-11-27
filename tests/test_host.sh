@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end test of the host build against tests/mock_torbox.py: login, lists, folder picker, downloads
-# (multi-connection, single connection without Range, broken connections, pause/resume, cancel, restart resume).
+# (multi-connection, single connection without Range, broken connections, pause/resume, cancel, restart resume),
+# Real-Debrid and AllDebrid (logins, lists, unrestricted/unlocked links) and the update check.
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 bin=$here/build/host/torbox-ps5
@@ -16,7 +17,8 @@ python3 -I "$here/tests/mock_torbox.py" $mport > "$work/mock.log" 2>&1 &
 pids+=($!)
 for _ in $(seq 50); do curl -s -o /dev/null http://127.0.0.1:$mport/ && break; sleep 0.1; done
 start_app() {
-    TORBOX_API_BASE=http://127.0.0.1:$mport/v1/api RD_API_BASE=http://127.0.0.1:$mport/rest/1.0 TORBOX_APP_DIR=$work/app TORBOX_DOWNLOADS=$work/dl \
+    TORBOX_API_BASE=http://127.0.0.1:$mport/v1/api RD_API_BASE=http://127.0.0.1:$mport/rest/1.0 AD_API_BASE=http://127.0.0.1:$mport AD_DELAYED_POLL_MS=200 \
+        TORBOX_UPDATE_URL=http://127.0.0.1:$mport/repos/x/torbox-ps5/releases/latest TORBOX_APP_DIR=$work/app TORBOX_DOWNLOADS=$work/dl \
         TORBOX_ROOTS=$work TORBOX_PORT=$port TORBOX_LOW_SPEED_TIME=2 TORBOX_STALL_MS=4000 TORBOX_RETRY_MAX_MS=500 ${1+"$@"} "$bin" >> "$work/app.log" 2>&1 &
     app_pid=$!
     pids+=($app_pid)
@@ -210,6 +212,58 @@ r=$(post logout -d provider=realdebrid)
 check "RD: logout keeps TorBox" bash -c "test ! -e $work/app/realdebrid-token.txt && test -e $work/app/torbox-key.txt"
 check "RD: lists refused after logout" bash -c "curl -s '$base/api/rd/torrents' | grep -q 'not logged in'"
 check "RD: token and direct links not in logs" bash -c "! grep -rqE 'rd-test-token|rdfile' $work/app/log.txt $work/app.log"
+
+# ---------- AllDebrid ----------
+adq() { curl -s "$base/api/ad/$1"; }
+r=$(post login -d provider=alldebrid --data-urlencode key=wrong-key-123)
+check "AD: bad key refused, readable" bash -c "grep -q 'bad API key' <<<'$r'"
+check "AD: bad key not stored" test ! -e "$work/app/alldebrid-key.txt"
+r=$(post login -d provider=alldebrid --data-urlencode key=ad-test-key-1)
+check "AD: key accepted, user shown" bash -c "grep -q '\"alldebrid\":{[^}]*\"logged_in\":true' <<<'$r' && grep -q adtester <<<'$r' && grep -q '\"premium\":true' <<<'$r'"
+check "AD: key stored separately (600)" bash -c "[[ \$(file_mode $work/app/alldebrid-key.txt) == 600 ]] && test -e $work/app/torbox-key.txt"
+check "AD: key never in status" bash -c "! curl -s $base/api/status | grep -q ad-test-key-1"
+r=$(adq magnets)
+check "AD: magnets listed" bash -c "python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert [m[\"id\"] for m in d[\"data\"]]==[11,12] and d[\"data\"][0][\"statusCode\"]==4' '$r'"
+r=$(adq "files?id=11")
+check "AD: magnet file tree" bash -c "python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); t=d[\"files\"][0]; assert t[\"n\"]==\"Movie Pack\" and t[\"e\"][0][\"l\"].endswith(\"MOVIE\")' '$r'"
+check "AD: unknown magnet readable" bash -c "curl -s '$base/api/ad/files?id=99' | grep -q 'unknown magnet'"
+check "AD: bad magnet id refused" bash -c "curl -s '$base/api/ad/files?id=1x' | grep -q 'bad magnet id'"
+check "AD: saved links" bash -c "curl -s '$base/api/ad/links' | grep -q saved.bin"
+check "AD: empty history" bash -c "curl -s '$base/api/ad/history' | grep -q '\"data\":\[\]'"
+# Download all of magnet 11 the way the page does, a saved link named by AllDebrid, and an unsupported host.
+post download -d kind=ad --data-urlencode "url=https://alldebrid.com/f/MOVIE" -d name=movie.mkv \
+    --data-urlencode "subdir=Movie Pack" --data-urlencode "folder=$work/dl/ad" > /dev/null
+post download -d kind=ad --data-urlencode "url=https://alldebrid.com/f/TRAILER" -d name=trailer.mp4 \
+    --data-urlencode "subdir=Movie Pack/Extras" --data-urlencode "folder=$work/dl/ad" > /dev/null
+post download -d kind=ad --data-urlencode "url=https://1fichier.com/?SAVED" -d name= \
+    --data-urlencode "folder=$work/dl/ad" > /dev/null
+post download -d kind=ad --data-urlencode "url=https://unsupported.example/file/2" -d name= \
+    --data-urlencode "folder=$work/dl/ad" > /dev/null
+check "AD: downloads finish" wait_jobs 120
+check "AD: movie.mkv content" verify "$work/dl/ad/Movie Pack/movie.mkv" $((20 * 1048576))
+check "AD: delayed link waited for" verify "$work/dl/ad/Movie Pack/Extras/trailer.mp4" $((4 * 1048576))
+check "AD: unnamed link named by AllDebrid" verify "$work/dl/ad/saved.bin" $((6 * 1048576))
+check "AD: unsupported host fails readably" bash -c "curl -s $base/api/jobs | grep -q 'unsupported host'"
+n=$(curl -s "http://127.0.0.1:$mport/control/stats" | jq_ 'd["ad_unlock"].get("https://unsupported.example/file/2", 0)')
+check "AD: unsupported host not retried ($n calls)" test "$n" -eq 1
+check "AD: queue file has no direct links" bash -c "! grep -q adfile $work/app/queue.tsv"
+r=$(post logout -d provider=alldebrid)
+check "AD: logout keeps TorBox" bash -c "test ! -e $work/app/alldebrid-key.txt && test -e $work/app/torbox-key.txt"
+check "AD: lists refused after logout" bash -c "curl -s '$base/api/ad/magnets' | grep -q 'not logged in'"
+check "AD: key and direct links not in logs" bash -c "! grep -rqE 'ad-test-key-1|adfile' $work/app/log.txt $work/app.log"
+
+# ---------- update check ----------
+r=$(get update)
+check "update: newer release offered" bash -c "python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d[\"newer\"] and d[\"latest\"]==\"v9.9.9\" and d[\"url\"].endswith(\"v9.9.9\")' '$r'"
+cur=$(jq_ 'd["current"]' <<<"$r")
+curl -s "http://127.0.0.1:$mport/control?release=v$cur" > /dev/null
+r=$(get "update?fresh=1")
+check "update: same version is not newer" bash -c "python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert not d[\"newer\"] and d[\"latest\"]==\"v$cur\"' '$r'"
+curl -s "http://127.0.0.1:$mport/control?release=v0.9.0" > /dev/null
+check "update: older release is not newer" bash -c "get() { curl -s $base/api/\$1; }; get 'update?fresh=1' | grep -q '\"newer\":false'"
+curl -s "http://127.0.0.1:$mport/control?release=none" > /dev/null
+check "update: no release yet readable" bash -c "curl -s '$base/api/update?fresh=1' | grep -q 'no release published yet'"
+curl -s "http://127.0.0.1:$mport/control?release=v9.9.9" > /dev/null
 
 # Cancel deletes the partial file.
 id=$(post download -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((48 * 1048576))?rate=2000000" \

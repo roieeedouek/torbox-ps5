@@ -20,6 +20,7 @@
 const provider providers[PROV_COUNT] = {
     {"torbox", "TorBox", "torbox-key.txt"},
     {"realdebrid", "Real-Debrid", "realdebrid-token.txt"},
+    {"alldebrid", "AllDebrid", "alldebrid-key.txt"},
 };
 
 static pthread_mutex_t g_cred_lock = PTHREAD_MUTEX_INITIALIZER;

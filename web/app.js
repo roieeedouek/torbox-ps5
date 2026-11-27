@@ -1,4 +1,4 @@
-// TorBox for PS5 web UI. Talks only to the console; the console talks to TorBox and Real-Debrid.
+// TorBox for PS5 web UI. Talks only to the console; the console talks to TorBox, Real-Debrid and AllDebrid.
 "use strict";
 
 const $ = (s) => document.querySelector(s);
@@ -13,15 +13,20 @@ const PROVIDERS = {
     help: "Paste your Real-Debrid private API token (real-debrid.com/apitoken, while logged in there).",
     tabs: [["rd-torrents", "Torrents"], ["rd-history", "History"]],
   },
+  alldebrid: {
+    title: "AllDebrid", keyName: "API key",
+    help: "Paste an AllDebrid API key (alldebrid.com/apikeys, while logged in there).",
+    tabs: [["ad-magnets", "Magnets"], ["ad-links", "Saved links"], ["ad-history", "History"]],
+  },
 };
 function loadPref(k, d) { try { return localStorage.getItem(k) || d; } catch (e) { return d; } }
 function savePref(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* private mode */ } }
 
-const hashProvider = location.hash.slice(1); // #torbox or #realdebrid picks the service (bookmarks)
+const hashProvider = location.hash.slice(1); // #torbox, #realdebrid or #alldebrid picks the service (bookmarks)
 const state = {
   provider: PROVIDERS[hashProvider] ? hashProvider : PROVIDERS[loadPref("provider", "")] ? loadPref("provider", "") : "torbox",
-  tab: { torbox: "torrents", realdebrid: "rd-torrents" },
-  lists: {}, open: new Set(), rdInfo: {}, status: null, jobs: [], pollTimer: 0,
+  tab: { torbox: "torrents", realdebrid: "rd-torrents", alldebrid: "ad-magnets" },
+  lists: {}, open: new Set(), rdInfo: {}, adFiles: {}, status: null, jobs: [], pollTimer: 0, updateChecked: false,
 };
 
 function el(tag, props, ...children) {
@@ -97,7 +102,23 @@ async function loadStatus() {
   if (!$("#folder").value) $("#folder").value = loadPref("folder", state.status.default_folder);
   render();
   pollJobs();
+  if (!state.updateChecked) { state.updateChecked = true; checkUpdate(false); }
 }
+
+// Update check: the console asks GitHub for the newest release (cached there for 6 hours).
+async function checkUpdate(manual) {
+  let r;
+  try { r = await api("update" + (manual ? "?fresh=1" : "")); } catch (e) { if (manual) toast("Update check failed: " + e.message); return; }
+  const box = $("#update");
+  if (r.newer) {
+    box.replaceChildren(el("span", {}, "Update available: " + r.latest + " (you have " + r.current + ")."),
+      r.url ? el("a", { href: r.url, target: "_blank", rel: "noopener" }, "Release notes and download") : null,
+      el("span", { class: "muted small" }, "Replace the files on the console, then press Stop server and open the tile again; downloads resume."));
+    box.classList.remove("hidden");
+  } else box.classList.add("hidden");
+  if (manual) toast(r.newer ? "Update available: " + r.latest : r.error ? "Update check: " + r.error : "Up to date (" + r.current + ")");
+}
+$("#update-btn").addEventListener("click", () => checkUpdate(true));
 
 function accountText(id) {
   const p = state.status.providers[id], u = p.user;
@@ -105,6 +126,10 @@ function accountText(id) {
   if (id === "realdebrid") {
     const prem = u.type === "premium";
     return "Logged in as " + u.name + " · " + (prem ? "premium" + (u.expires ? " until " + u.expires.slice(0, 10) : "") : u.type + " account (downloads need premium)");
+  }
+  if (id === "alldebrid") {
+    const until = u.premium_until > 0 ? " until " + new Date(u.premium_until * 1000).toISOString().slice(0, 10) : "";
+    return "Logged in as " + u.name + " · " + (u.premium ? "premium" + until : u.trial ? "trial account" : "free account (downloads need premium)");
   }
   return "Logged in as " + u.name + (u.expires ? " · plan until " + u.expires.slice(0, 10) : "");
 }
@@ -128,8 +153,12 @@ function render() {
   $("#login").classList.add("hidden"); $("#app").classList.remove("hidden");
   $("#account").textContent = P.title + ": " + accountText(state.provider) + " · " + s.mode + " " + s.version;
   $("#logout").textContent = "Log out of " + P.title;
-  $("#url-rd-wrap").classList.toggle("hidden", !s.providers.realdebrid.logged_in);
-  $("#url-rd").checked = state.provider === "realdebrid";
+  const viaRd = s.providers.realdebrid.logged_in, viaAd = s.providers.alldebrid.logged_in;
+  $("#url-via-wrap").classList.toggle("hidden", !viaRd && !viaAd);
+  $("#url-via").querySelector("[value=rd]").hidden = !viaRd;
+  $("#url-via").querySelector("[value=ad]").hidden = !viaAd;
+  $("#url-via").value = state.provider === "realdebrid" && viaRd ? "rd" : state.provider === "alldebrid" && viaAd ? "ad" :
+    viaRd ? "rd" : viaAd ? "ad" : "url";
   $("#tabs").replaceChildren(...P.tabs.map(([id, label]) => el("button", { "data-tab": id, onclick: () => showTab(id) }, label)),
     el("button", { "data-tab": "downloads", onclick: () => showTab("downloads") }, "Downloads ", el("span", { id: "badge", class: "badge hidden" }, "0")));
   showTab(curTab());
@@ -144,7 +173,7 @@ $("#login-form").addEventListener("submit", async (ev) => {
   try {
     await api("login", { provider: state.provider, key: input.value.trim() });
     input.value = "";
-    state.lists = {}; state.rdInfo = {};
+    state.lists = {}; state.rdInfo = {}; state.adFiles = {};
     await loadStatus();
   } catch (e) {
     $("#login-error").textContent = e.message;
@@ -157,8 +186,8 @@ $("#logout").addEventListener("click", async () => {
   const P = PROVIDERS[state.provider];
   if (!confirm("Log out of " + P.title + " and delete its stored " + P.keyName + " from the console?")) return;
   await api("logout", { provider: state.provider }).catch((e) => toast(e.message));
-  for (const k of Object.keys(state.lists)) if (k.startsWith(state.provider === "realdebrid" ? "rd-" : "") === (state.provider === "realdebrid")) delete state.lists[k];
-  state.rdInfo = {};
+  for (const [tab] of P.tabs) delete state.lists[tab];
+  state.rdInfo = {}; state.adFiles = {};
   loadStatus();
 });
 
@@ -186,11 +215,17 @@ function showTab(tab) {
 // Real-Debrid lists come in pages; a list keeps {items, total, page}.
 async function loadList(fresh, more) {
   const tab = curTab();
-  const rd = tab.startsWith("rd-");
+  const rd = tab.startsWith("rd-"), ad = tab.startsWith("ad-");
   const old = state.lists[tab];
   if (!more) { $("#list-status").textContent = "Loading..."; $("#items").replaceChildren(); $("#more").classList.add("hidden"); }
   try {
-    if (rd) {
+    if (ad) {
+      const r = await api("ad/" + tab.slice(3));
+      let items = Array.isArray(r.data) ? r.data : Object.values(r.data || {});
+      if (tab === "ad-magnets") items.sort((a, b) => (b.uploadDate || 0) - (a.uploadDate || 0));
+      else items.sort((a, b) => (b.date || 0) - (a.date || 0));
+      state.lists[tab] = { items, total: items.length, page: 1 };
+    } else if (rd) {
       const page = more && old ? old.page + 1 : 1;
       const r = await api("rd/" + (tab === "rd-torrents" ? "torrents" : "downloads") + "?limit=100&page=" + page);
       const items = (more && old ? old.items : []).concat(Array.isArray(r.data) ? r.data : []);
@@ -213,6 +248,7 @@ async function loadList(fresh, more) {
 
 $("#refresh").addEventListener("click", () => {
   if (curTab().startsWith("rd-")) state.rdInfo = {};
+  if (curTab().startsWith("ad-")) state.adFiles = {};
   loadList(true);
 });
 $("#more").addEventListener("click", () => loadList(false, true));
@@ -228,8 +264,11 @@ function renderList() {
   $("#list-status").textContent = items.length ?
     (shown.length === items.length ? items.length + (more ? " of " + L.total : "") + " item(s)" : shown.length + " of " + items.length) :
     tab.startsWith("rd-") ? "Nothing here yet. Add torrents on real-debrid.com, then press Refresh." :
+    tab === "ad-history" ? "Nothing here yet (AllDebrid keeps history only when it is enabled in your account settings)." :
+    tab.startsWith("ad-") ? "Nothing here yet. Add magnets or links on alldebrid.com, then press Refresh." :
       "Nothing here yet. Add downloads on torbox.app, then press Refresh.";
-  const render = tab === "rd-torrents" ? renderRdTorrent : tab === "rd-history" ? renderRdHistory : renderItem;
+  const render = tab === "rd-torrents" ? renderRdTorrent : tab === "rd-history" ? renderRdHistory :
+    tab === "ad-magnets" ? renderAdMagnet : tab.startsWith("ad-") ? renderAdLink : renderItem;
   $("#items").replaceChildren(...shown.slice(0, 500).map(render));
   $("#more").classList.toggle("hidden", !more);
   $("#more").textContent = "Load more (" + (L.total - items.length) + " left)";
@@ -364,6 +403,66 @@ function renderRdHistory(d) {
   ]);
 }
 
+// ---------- AllDebrid ----------
+// A magnet's files come as a tree: folders {n, e: [...]}, files {n, s, l}. Flattened to {path, size, link}.
+function adFlatten(nodes, dir, out) {
+  for (const n of nodes || []) {
+    const path = dir ? dir + "/" + n.n : String(n.n || "");
+    if (Array.isArray(n.e)) adFlatten(n.e, path, out);
+    else out.push({ path, size: n.s, link: n.l });
+  }
+  return out;
+}
+async function adFiles(id) {
+  if (!state.adFiles[id]) state.adFiles[id] = adFlatten((await api("ad/files?id=" + encodeURIComponent(id))).files, "", []);
+  return state.adFiles[id];
+}
+// Jobs for magnet files: the links are unlocked when each download starts. With withDir the magnet's folder
+// structure is kept, adding the magnet's own name on top when the paths don't start with it.
+function adJobs(m, all, files, withDir) {
+  const top = m.filename || "download";
+  const inTop = all.every((f) => f.path.startsWith(top + "/"));
+  const dirFor = (f) => {
+    const d = dirOf(f.path);
+    return inTop || all.length === 1 ? d : top + (d ? "/" + d : "");
+  };
+  return files.filter((f) => f.link).map((f) => ({ kind: "ad", url: f.link, name: baseOf(f.path), subdir: withDir ? dirFor(f) : "" }));
+}
+
+function renderAdMagnet(m) {
+  const key = "ad:" + m.id, open = state.open.has(key), files = state.adFiles[m.id];
+  const ready = m.statusCode === 4, bad = m.statusCode >= 5;
+  const pct = m.size > 0 && m.downloaded >= 0 ? " " + Math.floor((m.downloaded / m.size) * 100) + "%" : "";
+  const stText = ready ? "ready" : (m.status || "processing") + (m.statusCode === 1 ? pct : "");
+  const toggle = async () => {
+    if (open) { state.open.delete(key); return renderList(); }
+    try { await adFiles(m.id); state.open.add(key); renderList(); } catch (e) { toast(e.message); }
+  };
+  const all = async () => {
+    try { const f = await adFiles(m.id); queue(adJobs(m, f, f, true)); } catch (e) { toast(e.message); }
+  };
+  const extra = open && files ? el("ul", { class: "files" }, files.map((f) => el("li", {},
+    el("span", { class: "fname" }, f.path), el("span", { class: "fsize" }, size(f.size)),
+    el("button", { class: "small", type: "button", disabled: !ready || !f.link, onclick: () => queue(adJobs(m, files, [f], false)) }, "Download")))) : null;
+  return itemCard(m.filename, [
+    el("span", { class: "state " + (ready ? "ready" : bad ? "bad" : "busy") }, stText), el("span", {}, size(m.size)),
+    m.uploadDate ? el("span", {}, new Date(m.uploadDate * 1000).toISOString().slice(0, 10)) : null,
+  ], [
+    el("button", { class: "small", type: "button", disabled: !ready, onclick: toggle }, open ? "Hide files" : "Show files"),
+    el("button", { class: "small primary", type: "button", disabled: !ready, onclick: all }, "Download all files"),
+  ], extra);
+}
+
+function renderAdLink(d) {
+  return itemCard(d.filename || d.link, [
+    el("span", {}, size(d.size)), d.host ? el("span", {}, d.host) : null,
+    d.date ? el("span", {}, new Date(d.date * 1000).toISOString().slice(0, 10)) : null,
+  ], [
+    el("button", { class: "small primary", type: "button", disabled: !d.link,
+      onclick: () => queue([{ kind: "ad", url: d.link, name: d.filename || "" }]) }, "Download"),
+  ]);
+}
+
 function updateBadge() {
   const active = state.jobs.filter((j) => ["queued", "starting", "downloading"].includes(j.state)).length;
   const badge = $("#badge");
@@ -461,8 +560,8 @@ $("#url-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
   const u = $("#url").value.trim();
   if (!u) return;
-  const viaRd = !$("#url-rd-wrap").classList.contains("hidden") && $("#url-rd").checked;
-  queue([viaRd ? { kind: "rd", url: u, name: "" } : { kind: "url", url: u }]).then(() => { $("#url").value = ""; });
+  const via = $("#url-via-wrap").classList.contains("hidden") ? "url" : $("#url-via").value;
+  queue([via === "url" ? { kind: "url", url: u } : { kind: via, url: u, name: "" }]).then(() => { $("#url").value = ""; });
 });
 
 // ---------- folder picker ----------

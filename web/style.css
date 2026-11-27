@@ -84,5 +84,7 @@ code { font-size: 13px; overflow-wrap: anywhere; }
 .providers button .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: currentColor; margin-left: 6px; vertical-align: middle; opacity: .8; }
 .check { display: flex; gap: 8px; align-items: center; font-size: 14px; color: var(--muted); margin-top: 8px; }
 #more { display: block; margin: 10px auto; }
+.update { background: var(--card); border: 1px solid var(--accent); border-radius: 12px; padding: 10px 14px; margin: 12px 0 0; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.update a { font-weight: 600; }
 .links-note { font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
 .logview { margin: 0; padding: 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; overflow: auto; flex: 1; min-height: 220px; max-height: 65vh; font-size: 12px; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere; }

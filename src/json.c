@@ -137,6 +137,8 @@ const char *json_array_first(const char *arr) {
     return *p == ']' || !*p ? NULL : p;
 }
 
+const char *json_end(const char *val) { return val ? skip_value(val) : NULL; }
+
 const char *json_array_next(const char *elem) {
     const char *p = skip_value(elem);
     if (!p) return NULL;

@@ -23,9 +23,11 @@ enum { J_QUEUED, J_STARTING, J_RUNNING, J_DONE, J_FAILED, J_PAUSED, J_CANCELLED 
 static const char *state_names[] = {"queued", "starting", "downloading", "done", "failed", "paused", "cancelled"};
 
 #define MAX_JOBS 1000
-// Max connections per file, also Auto's ceiling. On the console TorBox gave ~52 MB/s with 8 and ~100 MB/s with 16;
-// the AIMD window still starts at 8 and halves on 429/5xx/timeouts.
-#define MAX_CONNS 16
+// Connections per file. On the console TorBox gave ~52 MB/s with 8 and ~100 MB/s with 16, so Auto stops at 16
+// (the AIMD window starts at 8 and halves on 429/5xx/timeouts). 24 and 32 can be chosen by hand: with 1.0.0's
+// engine 32 made TorBox's CDN stall most connections.
+#define MAX_CONNS 32
+#define AUTO_CONNS 16
 #define MAX_SEGS 256                     // segment table entries (grow when idle connections split tails)
 #define MULTI_MIN (8ll * 1024 * 1024)    // smaller files use one connection
 #define CHUNK_CAP (512ll * 1024 * 1024)  // large range ceiling cuts CDN req/min 32x while claim_seg() still tail-splits
@@ -38,8 +40,8 @@ typedef struct job {
     volatile int stop; // 1 = pause, 2 = cancel (delete the partial file)
     char kind[12];
     long long item_id, file_id;
-    char *url;    // kind "url": the link; kind "rd": the hoster link Real-Debrid unrestricts
-    char *direct; // kind "rd": the last unrestricted (direct) link, kept in memory only: it expires
+    char *url;    // kind "url": the link; kind "rd"/"ad": the hoster link Real-Debrid/AllDebrid unrestricts
+    char *direct; // kind "rd"/"ad": the last unrestricted (direct) link, kept in memory only: it expires
     int max_conns; // the server's limit on connections per file (Real-Debrid's "chunks"), 0 = none
     char folder[1024], subdir[512], name[256], path[1800];
     int64_t total, done, start_done, started_ms, finished_ms;
@@ -54,7 +56,7 @@ typedef struct job {
 
 static job *g_jobs[MAX_JOBS];
 static int g_njobs, g_next_id = 1, g_running;
-static int g_parallel = 1, g_connections = 0; // 0 = Auto (up to MAX_CONNS, adapted by AIMD)
+static int g_parallel = 1, g_connections = 0; // 0 = Auto (up to AUTO_CONNS, adapted by AIMD)
 static volatile int g_quit;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
@@ -978,7 +980,7 @@ static int transfer(job *j, const char *url, char *err, size_t errlen) {
     x->j = j;
     pthread_mutex_init(&x->state_lock, NULL);
     x->is_debrid = net_is_debrid_cdn(url) || !strcmp(j->kind, "torrents") || !strcmp(j->kind, "webdl") ||
-                   !strcmp(j->kind, "usenet") || !strcmp(j->kind, "rd");
+                   !strcmp(j->kind, "usenet") || !strcmp(j->kind, "rd") || !strcmp(j->kind, "ad");
     x->stall_ms = test_env_int("TORBOX_STALL_MS", 30000);
     x->low_speed_time = test_env_int("TORBOX_LOW_SPEED_TIME", 20);
 
@@ -1015,7 +1017,7 @@ static int transfer(job *j, const char *url, char *err, size_t errlen) {
     net_host_of(final_url, x->cdn, sizeof x->cdn);
     if (net_is_debrid_cdn(final_url)) x->is_debrid = 1;
 
-    int conns = g_connections == 0 ? MAX_CONNS : g_connections;
+    int conns = g_connections == 0 ? AUTO_CONNS : g_connections;
     if (j->max_conns > 0 && conns > j->max_conns) conns = j->max_conns;
     if (conns < 1) conns = 1;
     if (conns > MAX_CONNS) conns = MAX_CONNS;
@@ -1723,7 +1725,8 @@ static void set_state(job *j, int st, const char *err) {
     pthread_mutex_unlock(&g_lock);
 }
 
-static int rd_resolve(job *j, char *url, size_t urllen, char *err, size_t errlen, int *permanent) {
+// Real-Debrid or AllDebrid: hoster link -> direct link (kept in memory only).
+static int hoster_resolve(job *j, char *url, size_t urllen, char *err, size_t errlen, int *permanent) {
     *permanent = 0;
     if (j->direct) {
         snprintf(url, urllen, "%s", j->direct);
@@ -1731,7 +1734,9 @@ static int rd_resolve(job *j, char *url, size_t urllen, char *err, size_t errlen
     }
     char name[256] = "";
     int chunks = 0;
-    if (rd_unrestrict(j->url ? j->url : "", url, urllen, name, sizeof name, &chunks, permanent, err, errlen))
+    const char *link = j->url ? j->url : "";
+    if (!strcmp(j->kind, "ad") ? ad_unlock(link, url, urllen, name, sizeof name, permanent, err, errlen)
+                               : rd_unrestrict(link, url, urllen, name, sizeof name, &chunks, permanent, err, errlen))
         return -1;
     pthread_mutex_lock(&g_lock);
     free(j->direct);
@@ -1764,11 +1769,11 @@ static void sleep_job_ms(job *j, int ms) {
 static void run_job(job *j) {
     char err[300] = "", url[4096];
     char dir[1800];
-    int is_rd = !strcmp(j->kind, "rd"), permanent = 0;
+    int is_rd = !strcmp(j->kind, "rd") || !strcmp(j->kind, "ad"), permanent = 0; // hoster link to unrestrict
     int is_tb = !strcmp(j->kind, "torrents") || !strcmp(j->kind, "webdl") || !strcmp(j->kind, "usenet");
     for (int i = 0; is_rd && !j->name[0] && i < 3; i++) {
         if (i) sleep_job_ms(j, 3000);
-        if (!rd_resolve(j, url, sizeof url, err, sizeof err, &permanent)) break;
+        if (!hoster_resolve(j, url, sizeof url, err, sizeof err, &permanent)) break;
         if (permanent || i == 2 || j->stop || g_quit) {
             set_state(j, j->stop == 1 ? J_PAUSED : j->stop == 2 ? J_CANCELLED : g_quit ? J_QUEUED : J_FAILED, err);
             return;
@@ -1816,7 +1821,7 @@ static void run_job(job *j) {
         if (j->stop || g_quit) break;
         if (!strcmp(j->kind, "url")) snprintf(url, sizeof url, "%s", j->url ? j->url : "");
         else if (is_rd) {
-            if (rd_resolve(j, url, sizeof url, err, sizeof err, &permanent)) {
+            if (hoster_resolve(j, url, sizeof url, err, sizeof err, &permanent)) {
                 pthread_mutex_lock(&g_lock);
                 snprintf(j->err, sizeof j->err, "%s", err);
                 pthread_mutex_unlock(&g_lock);
@@ -1940,7 +1945,7 @@ void dl_init(int workers) {
 
 int dl_add(const char *kind, long long item_id, long long file_id, const char *url, const char *folder,
            const char *subdir, const char *name, char *err, size_t errlen) {
-    int is_rd = !strcmp(kind, "rd"), is_url = !strcmp(kind, "url") || is_rd;
+    int is_rd = !strcmp(kind, "rd") || !strcmp(kind, "ad"), is_url = !strcmp(kind, "url") || is_rd;
     if (!is_url && strcmp(kind, "torrents") && strcmp(kind, "webdl") && strcmp(kind, "usenet")) {
         snprintf(err, errlen, "unknown kind");
         return -1;
@@ -2122,7 +2127,7 @@ void dl_jobs_json(sbuf *o) {
         sb_puts(o, ",\"name\":");
         char shown[800];
         snprintf(shown, sizeof shown, "%s%s%s", j->subdir, j->subdir[0] ? "/" : "",
-                 j->name[0] ? j->name : "(name comes from Real-Debrid)");
+                 j->name[0] ? j->name : "(named when it starts)");
         sb_json_str(o, shown);
         sb_puts(o, ",\"path\":");
         sb_json_str(o, j->path);

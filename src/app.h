@@ -5,6 +5,7 @@
 
 #define APP_VERSION "1.1.0"
 #define APP_TITLE_ID "PPSA97630"
+#define APP_REPO "roieeedouek/torbox-ps5" // GitHub repository whose releases the update check reads
 #define APP_PORT 8080
 #define THREAD_STACK (1024 * 1024) // below 2 MiB: titles take bigger stacks from the small flexible pool
 
@@ -50,9 +51,10 @@ int json_bool(const char *val);                          // 1 true, 0 false, -1 
 long long json_int(const char *val, long long def);
 const char *json_array_first(const char *arr); // first element of the array at arr, or NULL
 const char *json_array_next(const char *elem); // element after elem, or NULL
+const char *json_end(const char *val);         // just past the value at val, or NULL
 
 // ---- providers, stored keys and HTTPS (net.c) ----
-enum { PROV_TORBOX, PROV_RD, PROV_COUNT };
+enum { PROV_TORBOX, PROV_RD, PROV_AD, PROV_COUNT };
 typedef struct {
     const char *id, *title, *key_file;
 } provider;
@@ -94,6 +96,24 @@ int rd_info(const char *id, sbuf *out, char *err, size_t errlen);
 // Hoster link -> direct download URL (+ file name, max chunks). *permanent: retrying will not help.
 int rd_unrestrict(const char *link, char *url, size_t urllen, char *name, size_t namelen, int *chunks, int *permanent,
                   char *err, size_t errlen);
+
+// ---- AllDebrid (alldebrid.c) ----
+void ad_init(void);
+// Validates key with /v4/user: 1 valid (user gets {"name","premium","premium_until","trial"}), 0 refused, -1 error.
+int ad_check_key(const char *key, sbuf *user, char *err, size_t errlen);
+// what: "magnets" (all magnets with status), "links" (saved links), "history" (recent links).
+// out gets {"ok":true,"data":[...]}. Returns the HTTP status (200 on success).
+int ad_list(const char *what, sbuf *out, char *err, size_t errlen);
+// The file tree of a ready magnet: out gets {"ok":true,"files":[...]} (nodes {n, s, l} or folders {n, e}).
+int ad_files(const char *id, sbuf *out, char *err, size_t errlen);
+// Hoster or magnet file link -> direct download URL (+ file name); waits for "delayed" links.
+int ad_unlock(const char *link, char *url, size_t urllen, char *name, size_t namelen, int *permanent, char *err,
+              size_t errlen);
+
+// ---- update check (update.c) ----
+void update_init(void);
+// out gets {"ok":true,"current","latest","newer","url","name","published","checked"}; fresh skips the cache.
+void update_json(sbuf *out, int fresh);
 
 // ---- async disk writer (writer.c) ----
 #define WBLOCK_SIZE (128 * 1024)

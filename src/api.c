@@ -32,7 +32,9 @@ static void json_ok(int fd) {
 static int check_key(int p, const char *key, char *err, size_t errlen) {
     sbuf u;
     sb_init(&u);
-    int rc = p == PROV_RD ? rd_check_key(key, &u, err, errlen) : tb_check_key(key, &u, err, errlen);
+    int rc = p == PROV_RD   ? rd_check_key(key, &u, err, errlen)
+             : p == PROV_AD ? ad_check_key(key, &u, err, errlen)
+                            : tb_check_key(key, &u, err, errlen);
     if (rc == 1) {
         pthread_mutex_lock(&g_user_lock);
         snprintf(g_user_json[p], sizeof g_user_json[p], "%s", u.data ? u.data : "{}");
@@ -191,6 +193,44 @@ static void route_rd(http_req *r, const char *what) {
     }
     if ((status == 200 || status == 204) && b.data) http_send_json(r->fd, 200, &b);
     else json_err(r->fd, status == 401 ? 401 : status >= 400 && status < 500 ? status : 502, err[0] ? err : "no answer");
+    sb_free(&b);
+}
+
+// AllDebrid: /api/ad/magnets, /api/ad/links, /api/ad/history, /api/ad/files?id=
+static void route_ad(http_req *r, const char *what) {
+    char id[32], err[300] = "", key[256];
+    int logged = cred_get(PROV_AD, key, sizeof key) == 0;
+    memset(key, 0, sizeof key);
+    if (!logged) {
+        json_err(r->fd, 401, "not logged in");
+        return;
+    }
+    sbuf b;
+    sb_init(&b);
+    int status;
+    if (!strcmp(what, "files")) {
+        form_get(r->query, "id", id, sizeof id);
+        status = ad_files(id, &b, err, sizeof err);
+    } else if (!strcmp(what, "magnets") || !strcmp(what, "links") || !strcmp(what, "history")) {
+        status = ad_list(what, &b, err, sizeof err);
+    } else {
+        sb_free(&b);
+        json_err(r->fd, 404, "unknown API call");
+        return;
+    }
+    if (status == 200 && b.data) http_send_json(r->fd, 200, &b);
+    else json_err(r->fd, status, err[0] ? err : "no answer");
+    sb_free(&b);
+}
+
+// Is a newer release out? ?fresh=1 asks GitHub again instead of using the 6-hour cache.
+static void route_update(http_req *r) {
+    char fresh[8];
+    form_get(r->query, "fresh", fresh, sizeof fresh);
+    sbuf b;
+    sb_init(&b);
+    update_json(&b, fresh[0] == '1');
+    http_send_json(r->fd, 200, &b);
     sb_free(&b);
 }
 
@@ -498,6 +538,8 @@ void api_handle(http_req *r) {
     if (get && !strcmp(p, "status")) route_status(r);
     else if (get && !strcmp(p, "list")) route_list(r);
     else if (get && !strncmp(p, "rd/", 3)) route_rd(r, p + 3);
+    else if (get && !strncmp(p, "ad/", 3)) route_ad(r, p + 3);
+    else if (get && !strcmp(p, "update")) route_update(r);
     else if (get && !strcmp(p, "dirs")) route_dirs(r);
     else if (get && !strcmp(p, "jobs")) route_jobs(r);
     else if (get && !strcmp(p, "log")) route_log(r);

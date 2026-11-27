@@ -9,6 +9,10 @@ Real-Debrid (same shapes as https://api.real-debrid.com/rest/1.0) under /rest/1.
 torrents/info/<id>, downloads, unrestrict/link. Token "rd-test-token". Direct links /rdfile/<issued>/<size>/<name>
 expire after RD["ttl"] seconds (403). /control?rd_ttl=N&rd_429=N sets the link lifetime and makes the next N API calls
 answer 429; /control/stats gives counts of unrestrict calls per link.
+AllDebrid (same shapes as https://api.alldebrid.com) under /v4 and /v4.1: user, magnet/status, magnet/files,
+user/links, user/history, link/unlock, link/delayed. Key "ad-test-key-1". Direct links /adfile/<size>/<name>.
+/control/stats also counts unlock calls per link.
+Update check: /repos/<owner>/<repo>/releases/latest answers tag RELEASE["tag"] (/control?release=vX.Y.Z sets it).
 Files: /files/<size>[?norange=1][&drop=<bytes>][&rate=<bytes/s>] serve <size> bytes whose byte i is i % 251.
   norange: ignore Range headers;  drop: close each connection after that many bytes (tests resume);
   rate: throttle each connection;  maxconn: answer 429 beyond that many parallel connections.
@@ -119,6 +123,30 @@ RD_HISTORY = [{"id": "D1", "filename": "history.iso", "mimeType": "application/o
                "generated": "2026-11-20T10:00:00.000Z"}]
 
 
+AD_KEY = "ad-test-key-1"
+ADL = "https://alldebrid.com/f/"
+AD = {"unlock": {}, "delayed": {}}
+# link -> (file name, size, delayed polls before ready, extra query for the direct link)
+AD_LINKS = {
+    ADL + "MOVIE": ("movie.mkv", 20 * MIB, 0, ""),
+    ADL + "TRAILER": ("trailer.mp4", 4 * MIB, 2, ""),
+    "https://1fichier.com/?SAVED": ("saved.bin", 6 * MIB, 0, ""),
+}
+AD_MAGNETS = [
+    {"id": 11, "filename": "Movie Pack", "size": 24 * MIB, "status": "Ready", "statusCode": 4, "downloaded": 24 * MIB,
+     "uploaded": 0, "seeders": 0, "downloadSpeed": 0, "uploadSpeed": 0, "uploadDate": 1764000000,
+     "completionDate": 1764000600},
+    {"id": 12, "filename": "Still going", "size": 10 * MIB, "status": "Downloading", "statusCode": 1,
+     "downloaded": 5 * MIB, "uploaded": 0, "seeders": 3, "downloadSpeed": 1000, "uploadSpeed": 0,
+     "uploadDate": 1764100000, "completionDate": 0},
+]
+AD_FILES = {11: [{"n": "Movie Pack", "e": [{"n": "movie.mkv", "s": 20 * MIB, "l": ADL + "MOVIE"},
+                                           {"n": "Extras", "e": [{"n": "trailer.mp4", "s": 4 * MIB, "l": ADL + "TRAILER"}]}]}]}
+AD_SAVED = [{"link": "https://1fichier.com/?SAVED", "filename": "saved.bin", "size": 6 * MIB, "date": 1764200000,
+             "host": "1fichier"}]
+RELEASE = {"tag": "v9.9.9"}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -187,12 +215,68 @@ class Handler(BaseHTTPRequestHandler):
                                         "streamable": 0})
         return self.rd_fail(404, "unknown_method", 3)
 
+    def ad_ok(self, data):
+        self.send_json(200, {"status": "success", "data": data})
+
+    def ad_fail(self, code, message):
+        self.send_json(200, {"status": "error", "error": {"code": code, "message": message}})
+
+    def ad_api(self, path, form):
+        if self.headers.get("Authorization", "") != "Bearer " + AD_KEY:
+            return self.ad_fail("AUTH_BAD_APIKEY", "The auth apikey is invalid")
+        if path == "/v4/user":
+            return self.ad_ok({"user": {"username": "adtester", "email": "ad@example.com", "isPremium": True,
+                                        "isSubscribed": False, "isTrial": False, "premiumUntil": 1800000000,
+                                        "lang": "en", "fidelityPoints": 0}})
+        if path == "/v4.1/magnet/status":
+            return self.ad_ok({"magnets": AD_MAGNETS})
+        if path == "/v4/magnet/files":
+            out = []
+            for i in form.get("id[]", []):
+                files = AD_FILES.get(int(i)) if i.isdigit() else None
+                out.append({"id": i, "files": files} if files else
+                           {"id": i, "error": {"code": "MAGNET_INVALID_ID", "message": "This magnet ID does not exists"}})
+            return self.ad_ok({"magnets": out})
+        if path == "/v4/user/links":
+            return self.ad_ok({"links": AD_SAVED})
+        if path == "/v4/user/history":
+            return self.ad_ok({"links": []})
+        if path == "/v4/link/unlock":
+            link = (form.get("link") or [""])[0]
+            AD["unlock"][link] = AD["unlock"].get(link, 0) + 1
+            if link.startswith("https://unsupported.example/"):
+                return self.ad_fail("LINK_HOST_NOT_SUPPORTED", "This host or link is not supported")
+            if link not in AD_LINKS:
+                return self.ad_fail("LINK_DOWN", "This link is not available on the file hoster website")
+            name, size, polls, extra = AD_LINKS[link]
+            direct = "http://%s/adfile/%d/%s%s" % (self.headers.get("Host"), size, name, extra)
+            if polls:
+                did = 700 + len(AD["delayed"])
+                AD["delayed"][did] = [polls, direct]
+                return self.ad_ok({"link": "", "filename": name, "host": "example", "filesize": size, "id": "g1",
+                                   "delayed": did})
+            return self.ad_ok({"link": direct, "filename": name, "host": "example", "filesize": size, "id": "g1",
+                               "streams": [], "paws": False})
+        if path == "/v4/link/delayed":
+            did = int((form.get("id") or ["0"])[0])
+            if did not in AD["delayed"]:
+                return self.ad_fail("DELAYED_INVALID_ID", "This delayed ID is invalid")
+            entry = AD["delayed"][did]
+            if entry[0] > 0:
+                entry[0] -= 1
+                return self.ad_ok({"status": 1, "time_left": 5})
+            return self.ad_ok({"status": 2, "time_left": 0, "link": entry[1]})
+        return self.send_json(404, {"status": "error", "error": {"code": "404", "message": "Endpoint doesn't exist"}})
+
     def do_POST(self):
         u = urlparse(self.path)
         n = int(self.headers.get("Content-Length", 0))
-        form = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode()).items()}
+        raw = parse_qs(self.rfile.read(n).decode())
+        form = {k: v[0] for k, v in raw.items()}
         if u.path.startswith("/rest/1.0/"):
             return self.rd_api("POST", u.path[len("/rest/1.0/"):], {}, form)
+        if u.path.startswith("/v4/") or u.path.startswith("/v4.1/"):
+            return self.ad_api(u.path, raw)
         self.fail(404, "ENDPOINT_NOT_FOUND", "Endpoint not found.")
 
     def do_GET(self):
@@ -202,7 +286,20 @@ class Handler(BaseHTTPRequestHandler):
             return self.serve_file(u.path, q)
         if u.path.startswith("/rest/1.0/"):
             return self.rd_api("GET", u.path[len("/rest/1.0/"):], q, {})
+        if u.path.startswith("/v4/") or u.path.startswith("/v4.1/"):
+            return self.ad_api(u.path, parse_qs(u.query))
+        if re.match(r"^/repos/[^/]+/[^/]+/releases/latest$", u.path):
+            if not RELEASE["tag"]:
+                return self.send_json(404, {"message": "Not Found"})
+            return self.send_json(200, {"tag_name": RELEASE["tag"], "name": "TorBox for PS5 " + RELEASE["tag"],
+                                        "html_url": "https://github.com/example/torbox-ps5/releases/tag/" + RELEASE["tag"],
+                                        "published_at": "2026-12-01T00:00:00Z", "assets": []})
+        m = re.match(r"^/adfile/(\d+)/", u.path)
+        if m:
+            return self.serve_file("/files/" + m.group(1), q)
         if u.path == "/control":
+            if "release" in q:
+                RELEASE["tag"] = q["release"] if q["release"] != "none" else ""
             if "rd_ttl" in q:
                 RD["ttl"] = int(q["rd_ttl"])
             if "rd_429" in q:
@@ -212,7 +309,8 @@ class Handler(BaseHTTPRequestHandler):
                     ONCE_200.add(q["once_200"])
             return self.send_json(200, {"ok": True})
         if u.path == "/control/stats":
-            return self.send_json(200, {"unrestrict": RD["unrestrict"], "tb_requestdl": TB_REQUESTDL})
+            return self.send_json(200, {"unrestrict": RD["unrestrict"], "tb_requestdl": TB_REQUESTDL,
+                                        "ad_unlock": AD["unlock"]})
         m = re.match(r"^/rdfile/(\d+)/(\d+)/", u.path)
         if m:
             if time.time() - int(m.group(1)) > RD["ttl"]:
