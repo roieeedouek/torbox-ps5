@@ -2,5 +2,4 @@ build/
 *.key
 torbox-data/
 __pycache__/
-ps5-payload-sdk
 .DS_Store

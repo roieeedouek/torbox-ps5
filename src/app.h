@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define APP_VERSION "1.1.2"
+#define APP_VERSION "1.1.0"
 #define APP_TITLE_ID "PPSA97630"
 #define APP_PORT 8080
 #define THREAD_STACK (1024 * 1024) // below 2 MiB: titles take bigger stacks from the small flexible pool

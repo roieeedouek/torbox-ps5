@@ -1,4 +1,4 @@
-// Download queue: curl_multi transfer engine with decoupled async disk writes, schedulable 16 MiB ranges,
+// Download queue: curl_multi transfer engine with decoupled async disk writes, byte ranges of up to 512 MiB,
 // tail splitting, per-host AIMD congestion control, USB/exFAT sequential sliding-window mode, and TorBox
 // CDN rotation.
 //
@@ -23,8 +23,9 @@ enum { J_QUEUED, J_STARTING, J_RUNNING, J_DONE, J_FAILED, J_PAUSED, J_CANCELLED 
 static const char *state_names[] = {"queued", "starting", "downloading", "done", "failed", "paused", "cancelled"};
 
 #define MAX_JOBS 1000
-#define MAX_CONNS 16                     // max connections per file
-#define DEBRID_AUTO_CONNS 8              // Auto mode ceiling for TorBox / Real-Debrid CDNs
+// Max connections per file, also Auto's ceiling. On the console TorBox gave ~52 MB/s with 8 and ~100 MB/s with 16;
+// the AIMD window still starts at 8 and halves on 429/5xx/timeouts.
+#define MAX_CONNS 16
 #define MAX_SEGS 256                     // segment table entries (grow when idle connections split tails)
 #define MULTI_MIN (8ll * 1024 * 1024)    // smaller files use one connection
 #define CHUNK_CAP (512ll * 1024 * 1024)  // large range ceiling cuts CDN req/min 32x while claim_seg() still tail-splits
@@ -53,7 +54,7 @@ typedef struct job {
 
 static job *g_jobs[MAX_JOBS];
 static int g_njobs, g_next_id = 1, g_running;
-static int g_parallel = 1, g_connections = 0; // 0 = Auto (8 on TorBox/RD, 16 on direct URLs)
+static int g_parallel = 1, g_connections = 0; // 0 = Auto (up to MAX_CONNS, adapted by AIMD)
 static volatile int g_quit;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
@@ -1014,7 +1015,7 @@ static int transfer(job *j, const char *url, char *err, size_t errlen) {
     net_host_of(final_url, x->cdn, sizeof x->cdn);
     if (net_is_debrid_cdn(final_url)) x->is_debrid = 1;
 
-    int conns = g_connections == 0 ? (x->is_debrid ? DEBRID_AUTO_CONNS : MAX_CONNS) : g_connections;
+    int conns = g_connections == 0 ? MAX_CONNS : g_connections;
     if (j->max_conns > 0 && conns > j->max_conns) conns = j->max_conns;
     if (conns < 1) conns = 1;
     if (conns > MAX_CONNS) conns = MAX_CONNS;

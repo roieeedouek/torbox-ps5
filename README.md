@@ -12,10 +12,17 @@ the TV: the home-screen tile opens it in the PS5's browser).
 - Download one file, all files of an item (folder structure kept), or the item as one ZIP, to a folder you choose:
   type it or pick it with the folder browser (`/data/...` and USB drives `/mnt/usbN`, `/mnt/extN`).
 - Progress bar, bytes, speed, time left, connections in use. Pause, resume, cancel, retry, a queue.
-- Several HTTP Range connections per file (1 to 16, default 8). When a connection finishes its part it splits the
-  largest remaining part, so all connections stay busy until the end.
+- Up to 16 HTTP Range connections per file (*Auto* or a fixed 1 to 16), about 100 MB/s from TorBox on the
+  console. When a connection finishes its part it splits the largest remaining part, so all connections stay busy
+  until the end. *Auto* halves the connection count when the server pushes back (429, 5xx, timeouts) and grows it
+  again when things settle.
 - Partial files resume: after a pause, an error, a network drop, a server restart or a console reboot, the download
-  continues from the `.part` file and its segment table (`.part.state`); nothing finished is fetched again.
+  continues from the `.part` file and its segment table (`.part.state`); nothing finished is fetched again. A
+  partial file is never deleted except by *Cancel*: when it can't be continued, the download stops and says why.
+- A TorBox download server that fails or stalls is replaced: the download asks TorBox for a fresh link and
+  continues the partial file.
+- USB drives (`/mnt/usbN`, usually exFAT) are written strictly in order, which exFAT needs to stay fast.
+- *Logs* (at the bottom of the page) shows the event log: speeds, connections, disk writes and errors.
 - A link box: any direct `http(s)://` URL, or, with Real-Debrid, a hoster link it unrestricts.
 
 ## Screenshots
@@ -103,8 +110,10 @@ or with any payload sender to port 9021.
 5. *Download* (one file, saved directly in the folder), *Download all files* (into `<folder>/<item name>/...`), or
    *As one ZIP*. The *Downloads* tab shows the queue. Items still downloading on TorBox's side can't be
    downloaded yet.
-6. In *Downloads*: *Connections per file* and *Files at a time* apply to downloads that start (or resume) from
-   then on. Pause, then Resume, to change the connections of a running download.
+6. In *Downloads*: *Connections per file* (*Auto*, the default, or 1 to 16) and *Files at a time* apply to
+   downloads that start (or resume) from then on. Pause, then Resume, to change the connections of a running
+   download. *Remove from list* keeps a paused or failed download's partial file, so adding the file again
+   continues it; *Cancel* deletes it.
 
 ### Real-Debrid details
 
@@ -130,15 +139,18 @@ or with any payload sender to port 9021.
 Measured on this console (fw 13.60) on the owner's network:
 
 - The console gives sockets a 64 KiB TCP receive buffer, which held one connection at about 1.2 MB/s
-  (window / round-trip time). The app asks for 512 KiB, the maximum the console grants: about 7.9 MB/s on one
-  connection to a public mirror.
-- TorBox downloads reached 16 to 26 MB/s total with 4 to 16 connections. 32 connections made TorBox's CDN stall
-  most of them, so the setting stops at 16. The best value depends on the CDN server you get (each start or
-  resume asks TorBox for a fresh link). 4 to 8 is a good start.
-- The console's internal storage took 130 to 180 MB/s of writes, so the disk is not the limit.
-- If you expect more (TorBox itself can do 80 to 90 MB/s), check the console's own link first. Open
+  (window / round-trip time). The app asks for up to 2 MiB; the console grants 512 KiB, which gave about 7.9 MB/s
+  on one connection to a public mirror.
+- TorBox downloads: about **100 MB/s with 16 connections**, about 52 MB/s with 8 (version
+  1.0.0, which gave each connection its own thread and wrote to disk from it, stayed at 15 to 26 MB/s). 32
+  connections made TorBox's CDN stall most of them, so the setting stops at 16.
+- At 16 connections the one network thread is busy about 90% of the time, so the console's CPU (TLS decryption)
+  is the next limit.
+- Writes go through their own thread in blocks of up to 2 MiB, so a slow write never holds up the network. The
+  console's internal storage took 130 to 180 MB/s of writes, and kept up at 100 MB/s with writes of about 12 ms.
+- If you get much less, check the console's own link first. Open
   `http://<console-ip>:8080/api/speedtest?mb=200` on a PC on the same network: it streams 200 MB from the
-  console. A Wi-Fi console showed about 23 MB/s there. A wired connection is the biggest win.
+  console (a PC on Wi-Fi limits this test too). A wired console is the safest bet.
 
 ## Files on the console
 
@@ -152,7 +164,8 @@ Measured on this console (fw 13.60) on the owner's network:
 <folder>/<name>.part(.state)      a download in progress and its segment table
 ```
 
-The server also logs to klog (port 3232).
+The server also logs to klog (port 3232). *Logs* on the page (or `GET /api/log`) shows the last 32 KB of
+`log.txt`.
 
 ## Security notes
 
@@ -170,7 +183,8 @@ Needs this checkout next to the PS5 toolchains in `../deps` (used in place, not 
 - `deps/ps5-vulkan` (native tool, app_crt, link recipe, libc.prx) and
   `deps/ps5-vulkan-template/.deps/native/ps5-payload-sdk` (for the title),
 - LLD 22 through `LLVM_CONFIG` (defaults to `../source-recomp/build/ps5-toolchain/llvm-config` when present),
-- python3 with numpy (icon), clang/gcc, and for the host build libcurl (`HOST_CURL`, default linuxbrew's).
+- python3 with numpy (icon), clang/gcc, and for the host build libcurl (`HOST_CURL`, default linuxbrew's or
+  Homebrew's, else the system's). The host build and the tests also run on macOS.
 
 ```sh
 ./build.sh host      # Linux build for testing            -> build/host/torbox-ps5
@@ -186,10 +200,12 @@ into the binary by `tools/embed.py`.
 
 `tests/mock_torbox.py` imitates the TorBox API (`user/me`, `*/mylist`, `*/requestdl`) and the Real-Debrid API
 (`/user`, paged `/torrents` with `X-Total-Count`, `/torrents/info`, `/downloads`, `/unrestrict/link`, direct links
-that expire, injected 429s), and serves test files with Range support, broken connections, throttling and
-connection limits. `tests/test_host.sh` covers both logins and logouts, lists and paging, file-to-link pairing,
-the folder browser, single and multi-connection downloads, resume after pause and after a restart, an expired
-Real-Debrid link unrestricted again, connection splitting, HTTP 429 limits, readable errors, cancel, and checksums.
+that expire, injected 429s), and serves test files with Range support, broken connections, throttling,
+connection limits, `Retry-After`, ETags, stalls and HTTP 400s. `tests/test_host.sh` covers both logins and
+logouts, lists and paging, file-to-link pairing, the folder browser, single and multi-connection downloads, resume
+after pause and after a restart, an expired Real-Debrid link unrestricted again, connection splitting, HTTP 429
+limits, readable errors, TorBox link refresh after a stall or an HTTP 400, partial files kept when a server
+misbehaves, in-order USB writes with a slow disk, the log endpoint (no secrets in it), cancel, and checksums.
 
 ### Code map
 
@@ -201,7 +217,9 @@ src/api.c        JSON API: status, login, logout, list, rd/*, dirs, mkdir, downl
 src/net.c        providers, key storage, HTTPS client (libcurl), socket tuning
 src/torbox.c     TorBox client
 src/realdebrid.c Real-Debrid client (rate limit, errors, file/link pairing, unrestrict)
-src/dl.c         queue, multi-connection downloads, resume, persistence
+src/dl.c         queue, downloads (curl_multi on one thread, connection control, TorBox link refresh, USB
+                 in-order mode), resume, persistence
+src/writer.c     disk writer thread: merges 128 KiB blocks into writes of up to 2 MiB
 src/platform.c   PS5 payload / host differences (paths, notifications, klog)
 web/             the page (plain HTML/CSS/JS, no external resources)
 title/           launcher title: launcher.c, build_title.sh, param.json, icon
@@ -212,3 +230,8 @@ APIs used:
   `GET /v1/api/{torrents,webdl,usenet}/requestdl?token=...&{torrent_id|web_id|usenet_id}=...&file_id=...|zip_link=true`.
 - Real-Debrid (`https://api.real-debrid.com/rest/1.0`, `Authorization: Bearer <token>`): `GET /user`,
   `GET /torrents?page=&limit=`, `GET /torrents/info/{id}`, `GET /downloads?page=&limit=`, `POST /unrestrict/link`.
+
+## Credits
+
+The download engine of version 1.1 (curl_multi, the disk writer thread, connection control, TorBox link refresh,
+USB in-order mode, the log viewer) was written by [temp-latif07](https://github.com/temp-latif07) in a fork.

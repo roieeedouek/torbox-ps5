@@ -137,8 +137,13 @@ post jobs/pause -d id="$id" > /dev/null
 sleep 1.5
 post settings -d connections=8 > /dev/null
 post jobs/resume -d id="$id" > /dev/null
-sleep 4
-conns=$(get jobs | jq_ "[j['conns'] for j in d['jobs'] if j['id']==$id][0]")
+conns=0 # highest count seen: the download can finish within a few seconds
+for _ in $(seq 20); do
+    sleep 0.2
+    c=$(get jobs | jq_ "[j['conns'] for j in d['jobs'] if j['id']==$id][0]")
+    ((c > conns)) && conns=$c
+    ((conns >= 6)) && break
+done
 check "resume with more connections splits segments ($conns)" test "$conns" -ge 6
 check "split download finishes" wait_jobs 120
 check "steal.bin content" verify "$work/dl/g/steal.bin" $((64 * 1048576))
@@ -210,9 +215,13 @@ check "RD: token and direct links not in logs" bash -c "! grep -rqE 'rd-test-tok
 id=$(post download -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((48 * 1048576))?rate=2000000" \
     --data-urlencode "folder=$work/dl/e" -d name=cancel.bin | jq_ 'd["id"]')
 sleep 2
-post jobs/cancel -d id="$id" > /dev/null
-sleep 1.5
-check "cancel removes partial" bash -c "curl -s $base/api/jobs | grep -q '\"state\":\"cancelled\"' && ! ls $work/dl/e/cancel.bin.part* 2>/dev/null"
+cancel_state() { get jobs | jq_ "[j['state']+' '+str(j['done']) for j in d['jobs'] if j['id']==$id][0]"; }
+before=$(cancel_state)
+r=$(post jobs/cancel -d id="$id")
+for _ in $(seq 50); do [[ $(cancel_state) == cancelled* ]] && break; sleep 0.1; done
+after=$(cancel_state)
+check "cancel removes partial" bash -c "[[ '$after' == cancelled* ]] && ! ls $work/dl/e/cancel.bin.part* 2>/dev/null"
+[[ $after == cancelled* ]] || echo "     before cancel: $before; cancel reply: $r; 5 s later: $after"
 
 # Existing file is not downloaded again.
 post download -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/5000000" \

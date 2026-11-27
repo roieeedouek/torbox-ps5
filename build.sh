@@ -10,20 +10,13 @@
 # Toolchains are used where they are (read-only, not copied into this repo):
 #   PS5_PAYLOAD_SDK  payload SDK with curl/OpenSSL  (default ../deps/ps5-sdk-full)
 #   PS5_DEPS         the deps folder                (default ../deps)
-#   CA_BUNDLE        CA certificates to embed       (default /etc/ssl/certs/ca-certificates.crt)
+#   PS5_HOMEBREW     libcurl/OpenSSL for the payload (default $PS5_PAYLOAD_SDK/target/user/homebrew)
+#   CA_BUNDLE        CA certificates to embed       (default /etc/ssl/certs/ca-certificates.crt, else /etc/ssl/cert.pem)
+#   HOST_CURL        libcurl prefix for the host build (default: linuxbrew's or Homebrew's, else the system's)
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 deps=${PS5_DEPS:-$(cd -- "$here/.." && pwd)/deps}
-overdrive_deps=$(cd -- "$here/.." && pwd)/overdrive-tb-3rd-user/ps5-react/.deps
-if [[ -n ${PS5_PAYLOAD_SDK:-} ]]; then
-    sdk=$PS5_PAYLOAD_SDK
-elif [[ -d $here/ps5-payload-sdk ]]; then
-    sdk=$here/ps5-payload-sdk
-elif [[ -d $deps/ps5-sdk-full ]]; then
-    sdk=$deps/ps5-sdk-full
-else
-    sdk=$overdrive_deps/sdk/ps5-payload-sdk
-fi
+sdk=${PS5_PAYLOAD_SDK:-$deps/ps5-sdk-full}
 if [[ -n ${CA_BUNDLE:-} ]]; then
     ca=$CA_BUNDLE
 elif [[ -f /etc/ssl/certs/ca-certificates.crt ]]; then
@@ -63,10 +56,7 @@ build_host() {
 build_payload() {
     gen_assets
     local hb=${PS5_HOMEBREW:-$sdk/target/user/homebrew}
-    if [[ ! -f $hb/lib/libcurl.a && -f $overdrive_deps/network-ports/v0.40.2/lib/libcurl.a ]]; then
-        hb=$overdrive_deps/network-ports/v0.40.2
-    fi
-    local ppath=$PATH
+    local ppath=$PATH # macOS: the SDK's clang wrapper needs Homebrew's LLVM 18 on PATH
     for llvm in /opt/homebrew/opt/llvm@18/bin /usr/local/opt/llvm@18/bin; do
         if [[ -d $llvm ]]; then ppath="$llvm:$ppath"; break; fi
     done
