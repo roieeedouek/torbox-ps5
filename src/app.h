@@ -180,7 +180,8 @@ int stream_create(const char *kind, const char *link, const char *name, sbuf *ou
                   size_t errlen);
 // Streams the file into the PS5 installer: a stream, started through shsrv's pkg_install (port 2323).
 int stream_install(const char *kind, const char *link, const char *name, sbuf *out, char *err, size_t errlen);
-int stream_remove(const char *id); // a finished/failed install or idle stream, by token or its first 8 characters
+// A finished/failed install or idle stream, by token or its first 8 characters; force also stops a running one.
+int stream_remove(const char *id, int force);
 void stream_handle(http_req *req); // GET/HEAD /stream/<token>/...
 void stream_list_json(sbuf *out);
 void stream_init(void); // restores streams saved before a restart

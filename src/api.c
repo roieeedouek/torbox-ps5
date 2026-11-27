@@ -274,9 +274,10 @@ static void route_install(http_req *r) {
 }
 
 static void route_stream_remove(http_req *r) {
-    char id[64];
+    char id[64], force[8];
     form_get(r->body, "id", id, sizeof id);
-    if (stream_remove(id)) json_err(r->fd, 409, "not possible while it runs");
+    form_get(r->body, "force", force, sizeof force);
+    if (stream_remove(id, force[0] == '1')) json_err(r->fd, 409, "it is still running: use Stop");
     else json_ok(r->fd);
 }
 

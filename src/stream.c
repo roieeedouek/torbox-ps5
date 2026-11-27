@@ -38,19 +38,30 @@ typedef struct {
     int64_t base;
     int64_t pos[4]; // where the installer's open requests are reading, -1 = free
     int ra_running, ra_quit; // ra_quit: asked to stop (the stream is being removed)
+    int stopping;            // Stop pressed in the page: answer no more requests, then remove the stream
+    int64_t gone_ms;         // when the installer last closed a connection in the middle of a transfer
     pthread_cond_t cv;
     // Install through the helper (helper/installer.c), when the stream was made for one.
-    double speed;            // bytes/s the installer is pulling, smoothed by the monitor
-    int64_t sp_bytes, sp_ms; // the monitor's last sample of `served`
+    // Speeds over the last ~20 s: the installer pulls in bursts (~900 MB at loopback speed, then ~5 s unpacking),
+    // so shorter windows swing between ~15 and ~190 MB/s. What it pulled, and what the read-ahead fetched.
+#define SP_RING 21
+    double speed, net_speed;
+    int64_t ra_fetched, ahead; // bytes fetched by the read-ahead so far / ready ahead of the installer
+    int64_t sp_ms[SP_RING], sp_served[SP_RING], sp_fetched[SP_RING]; // 1 s samples (ring), sp_n of them
+    int sp_n;
+    int64_t saved_served, saved_ms; // `served` survives restarts (streams.tsv); when it was last saved
+    int end_seen;                   // the installer read the file's end late in the install
+    int restored;                   // restored mid-install: the installer's next big read shows where it is
     int ins; // 0 none, 1 starting, 2 installing (the PS5 pulls the package), 3 done, 4 failed
     char ins_status[24], ins_err[200], content_id[48];
     int64_t ins_done, ins_total, ins_started_ms, ins_finished_ms, ins_report_ms;
 } stream_t;
 
-static const char *ins_names[] = {"", "starting", "installing", "installed", "failed"};
+static const char *ins_names[] = {"", "starting", "installing", "installed", "failed", "stopped"};
 
 static pthread_once_t g_monitor_once = PTHREAD_ONCE_INIT;
 static void start_monitor(void); // finishes installs (defined with the install code below)
+static void clear_slot_locked(stream_t *s);
 
 static stream_t g_streams[MAX_STREAMS];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -64,9 +75,9 @@ static void save_streams_locked(void) {
     for (int i = 0; i < MAX_STREAMS; i++) {
         stream_t *s = &g_streams[i];
         if (s->token[0]) // hoster links only, like queue.tsv: never the direct link
-            fprintf(f, "%s\t%s\t%lld\t%lld\t%s\t%s\t%d\t%s\n", s->token, s->kind, (long long)s->size,
+            fprintf(f, "%s\t%s\t%lld\t%lld\t%s\t%s\t%d\t%s\t%lld\n", s->token, s->kind, (long long)s->size,
                     (long long)s->last_ms, s->name, s->link ? s->link : "", s->ins,
-                    s->content_id[0] ? s->content_id : "-");
+                    s->content_id[0] ? s->content_id : "-", (long long)s->served);
     }
     fclose(f);
     rename(tmp, path);
@@ -84,9 +95,9 @@ void stream_init(void) {
     pthread_mutex_lock(&g_lock);
     while (line && n < MAX_STREAMS && fgets(line, 16384, f)) {
         line[strcspn(line, "\r\n")] = 0;
-        char *field[8];
+        char *field[9];
         int k = 0;
-        for (char *p = line, *save; k < 8 && (field[k] = strtok_r(k ? NULL : p, "\t", &save)); k++) {}
+        for (char *p = line, *save; k < 9 && (field[k] = strtok_r(k ? NULL : p, "\t", &save)); k++) {}
         if (k < 6 || strlen(field[0]) != 32) continue;
         stream_t *s = &g_streams[n++];
         memset(s, 0, sizeof *s);
@@ -100,11 +111,19 @@ void stream_init(void) {
         s->created_ms = s->last_ms = plat_now_ms();
         s->ins = k > 6 ? atoi(field[6]) : 0;
         if (k > 7 && strcmp(field[7], "-")) snprintf(s->content_id, sizeof s->content_id, "%s", field[7]);
+        if (k > 8) s->served = s->saved_served = atoll(field[8]); // progress so far (approximate after a restart)
+        if (s->ins == 4 && s->size > 0 && s->served >= s->size - s->size / 50) { // judged "stalled" by 1.2.0 near
+            s->ins = 3;                                                          // the end: it was delivered
+            snprintf(s->ins_status, sizeof s->ins_status, "delivered");
+            s->ins_err[0] = 0;
+        }
         if (s->ins == 1) { // the helper never picked it up before the restart
             s->ins = 4;
             snprintf(s->ins_err, sizeof s->ins_err, "the server restarted before the install started: try again");
         }
         s->ins_report_ms = plat_now_ms(); // an install in progress keeps reporting to the new server
+        s->ins_started_ms = s->created_ms; // its real start is not kept: count time from the restart
+        if (s->ins == 2) s->restored = 1;
     }
     pthread_mutex_unlock(&g_lock);
     free(line);
@@ -425,6 +444,13 @@ static int64_t serve_range(int fd, stream_t *s, const char *tok, int reqno, cons
     int failed = 0, gone = 0;
     while (next_send < nparts && !failed && !gone) {
         int64_t now = plat_now_ms();
+        pthread_mutex_lock(&g_lock);
+        int stop = s->stopping;
+        pthread_mutex_unlock(&g_lock);
+        if (stop) {
+            *why = "stopped";
+            break;
+        }
         // Queue new parts into free ring slots, and restart failed ones once their wait is over.
         while (next_issue < nparts && next_issue - next_send < PARTS_IN_FLIGHT) {
             part *pt = &ring[next_issue % PARTS_IN_FLIGHT];
@@ -612,8 +638,17 @@ static void *ra_thread(void *arg) {
         }
         int moved = 0;
         for (int i = 0; i < RA_WIN; i++)
-            if (win[i].avail != win[i].got) win[i].avail = win[i].got, moved = 1;
+            if (win[i].avail != win[i].got) s->ra_fetched += (int64_t)(win[i].got - win[i].avail), win[i].avail = win[i].got, moved = 1;
         if (moved) pthread_cond_broadcast(&s->cv);
+        {
+            int64_t ready = 0, lo = -1;
+            for (int i = 0; i < RA_WIN; i++)
+                if (win[i].idx >= base) ready += (int64_t)win[i].avail;
+            for (int i = 0; i < 4; i++)
+                if (s->pos[i] >= 0 && (lo < 0 || s->pos[i] < lo)) lo = s->pos[i];
+            if (lo >= base * RA_BLOCK) ready -= lo - base * RA_BLOCK;
+            s->ahead = ready > 0 ? ready : 0;
+        }
         if (limit < RA_WIN && now - calm_since >= 5000) limit++, calm_since = now; // no connection errors lately
         if (now - report_ms >= 10000) { // what limits the speed: few MB ahead = the network, many = the installer
             int64_t ahead = 0, done_now = fetched;
@@ -677,6 +712,7 @@ static void *ra_thread(void *arg) {
             if (bl) ra_drop(m, bl);
             else curl_multi_remove_handle(m, msg->easy_handle), curl_easy_cleanup(msg->easy_handle);
             if (bl && bl->got == bl->len) {
+                s->ra_fetched += (int64_t)(bl->got - bl->avail);
                 bl->state = 2, bl->avail = bl->got;
                 fetched += (int64_t)bl->len;
             } else if (bl) {
@@ -758,7 +794,7 @@ static int64_t serve_window(int fd, stream_t *s, const char *tok, int64_t a, int
         if (plat_start_thread(ra_thread, s)) s->ra_running = 0;
     }
     int64_t off = a, sent = 0;
-    while (off <= b && s->ra_running) {
+    while (off <= b && s->ra_running && !s->stopping) {
         int64_t k = off / RA_BLOCK;
         s->pos[me] = off;
         ra_update_base(s);
@@ -812,14 +848,31 @@ void stream_handle(http_req *r) {
     stream_t *s = NULL;
     for (int i = 0; i < MAX_STREAMS; i++)
         if (!strcmp(g_streams[i].token, tok)) s = &g_streams[i];
-    if (!s) {
+    if (!s || s->stopping) {
         pthread_mutex_unlock(&g_lock);
         http_send(r->fd, 404, "text/plain", "not found", 9, NULL);
         return;
     }
+    if (s->ins == 5) { // the PS5 pulls again after a pause we took for a cancel
+        s->ins = 2;
+        s->ins_err[0] = 0;
+        s->ins_finished_ms = 0;
+        plat_log("install %.8s: the PS5 resumed", tok);
+    }
     s->active++;
     int reqno = ++s->requests;
     int64_t size = s->size;
+    if (s->restored && r->range[0]) { // after a restart: the installer's first big read is where it really is
+        long long ra = -1, rb = -1;
+        if (sscanf(r->range, "bytes=%lld-%lld", &ra, &rb) == 2 && rb - ra + 1 >= (1 << 20)) {
+            if (ra > s->served && ra < size - 256ll * 1024 * 1024) {
+                plat_log("install %.8s: progress picked up at %lld (was %lld)", tok, ra, (long long)s->served);
+                s->served = s->saved_served = ra;
+                s->sp_n = 0; // that jump is not speed: measure afresh
+            }
+            s->restored = 0;
+        }
+    }
     snprintf(kind, sizeof kind, "%s", s->kind);
     char *link = strdup(s->link), *direct = s->direct ? strdup(s->direct) : NULL;
     pthread_mutex_unlock(&g_lock);
@@ -888,7 +941,11 @@ void stream_handle(http_req *r) {
         int64_t next = a;
         int gone = 0;
         if (b - a + 1 >= (1 << 20)) sent = serve_window(r->fd, s, tok, a, b, &next, &gone); // large reads
+        pthread_mutex_lock(&g_lock);
+        int stopping = s->stopping;
+        pthread_mutex_unlock(&g_lock);
         if (gone) why = "installer closed the connection";
+        else if (stopping) why = "stopped";
         else if (next <= b) sent += serve_range(r->fd, s, tok, reqno, kind, link, &direct, next, b, &why);
     }
 out:;
@@ -902,6 +959,8 @@ out:;
     if (!strcmp(s->token, tok)) {
         s->active--;
         s->last_ms = plat_now_ms();
+        if (!strcmp(why, "installer closed the connection") && a + sent <= b) s->gone_ms = s->last_ms;
+        if (sent > 0 && a + sent > b && b == size - 1 && s->served >= size * 9 / 10) s->end_seen = 1;
     }
     pthread_mutex_unlock(&g_lock);
 }
@@ -979,11 +1038,17 @@ static int shsrv_start(const char *url, char *content_id, size_t cidlen, char *e
 static void *monitor_thread(void *arg) {
     (void)arg;
     int64_t quiet_done = 8000, quiet_stall = 180000; // after the last request: delivered / stopped
+    int64_t quiet_cancel = 15000; // after the installer closed a connection mid-transfer: cancelled on the PS5
+    int64_t save_every = 5000;    // how often progress is saved for restarts
 #ifndef __PROSPERO__
     const char *env = getenv("TORBOX_INSTALL_QUIET_MS"); // host tests
     if (env && atoi(env) > 0) quiet_done = atoi(env);
     env = getenv("TORBOX_INSTALL_STALL_MS");
     if (env && atoi(env) > 0) quiet_stall = atoi(env);
+    env = getenv("TORBOX_INSTALL_CANCEL_MS");
+    if (env && atoi(env) > 0) quiet_cancel = atoi(env);
+    env = getenv("TORBOX_INSTALL_SAVE_MS");
+    if (env && atoi(env) > 0) save_every = atoi(env);
 #endif
     for (;;) {
         plat_sleep_ms(quiet_done < 3000 ? 500 : 1000);
@@ -991,25 +1056,59 @@ static void *monitor_thread(void *arg) {
         int64_t now = plat_now_ms();
         for (int i = 0; i < MAX_STREAMS; i++) {
             stream_t *s = &g_streams[i];
-            if (s->token[0] && now - s->sp_ms >= 900) { // speed over the last second, smoothed
-                double inst = s->sp_ms ? (double)(s->served - s->sp_bytes) * 1000.0 / (double)(now - s->sp_ms) : 0;
-                if (inst < 0) inst = 0;
-                s->speed = !s->active && inst == 0 ? 0 : s->speed > 0 ? s->speed * 0.6 + inst * 0.4 : inst;
-                s->sp_bytes = s->served, s->sp_ms = now;
+            int last = s->sp_n ? (s->sp_n - 1) % SP_RING : -1;
+            if (s->token[0] && (last < 0 || now - s->sp_ms[last] >= 900)) { // one sample a second
+                int k = s->sp_n % SP_RING, oldest = s->sp_n >= SP_RING ? (s->sp_n + 1) % SP_RING : 0;
+                s->sp_ms[k] = now, s->sp_served[k] = s->served, s->sp_fetched[k] = s->ra_fetched;
+                s->sp_n++;
+                if (s->sp_n >= 2) {
+                    double dt = (double)(now - s->sp_ms[oldest]) / 1000.0;
+                    s->speed = dt > 0 ? (double)(s->served - s->sp_served[oldest]) / dt : 0;
+                    s->net_speed = dt > 0 ? (double)(s->ra_fetched - s->sp_fetched[oldest]) / dt : 0;
+                    if (s->speed < 0) s->speed = 0;
+                    if (s->net_speed < 0) s->net_speed = 0;
+                }
+            }
+            if (s->stopping) { // Stop pressed: remove it once nothing uses it any more
+                s->ra_quit = 1;
+                if (!s->active && !s->ra_running) {
+                    plat_log("install %.8s: stopped and removed", s->token);
+                    clear_slot_locked(s);
+                    save_streams_locked();
+                }
+                continue;
             }
             if (s->ins != 2) continue;
             s->ins_done = s->served;
             s->ins_total = s->size;
             if (s->active) s->ins_report_ms = now; // the PS5 is pulling: that is its news
             else if (s->last_ms > s->ins_report_ms) s->ins_report_ms = s->last_ms;
-            int delivered = s->size > 0 && s->served >= s->size;
+            // The installer reads the package's end (its metadata) first and skips it in the main pass, so after a
+            // restart (progress picked up from its read position) the count ends short of the size: 98% then quiet
+            // is delivered. A cancel is told apart by the installer hanging up mid-transfer (checked before this).
+            int delivered = s->size > 0 && (s->served >= s->size - s->size / 50 || s->end_seen);
+            if (now - s->saved_ms >= save_every && s->served != s->saved_served) { // keep progress across restarts
+                s->saved_served = s->served, s->saved_ms = now;
+                save_streams_locked();
+            }
             int64_t quiet = now - (s->last_ms > s->ins_started_ms ? s->last_ms : s->ins_started_ms);
-            if (delivered && !s->active && quiet > quiet_done) {
+            int cancelled = s->gone_ms && s->gone_ms >= s->last_ms - 2000 && s->served < s->size;
+            if (delivered && !cancelled && !s->active && quiet > quiet_done) {
                 s->ins = 3;
                 s->ins_finished_ms = now;
                 snprintf(s->ins_status, sizeof s->ins_status, "delivered");
                 save_streams_locked();
                 plat_log("install %.8s: delivered %s (%lld bytes)", s->token, s->name, (long long)s->served);
+            } else if (!delivered && !s->active && s->gone_ms && s->gone_ms >= s->last_ms - 2000 &&
+                       now - s->last_ms > quiet_cancel) {
+                s->ins = 5; // the installer hung up mid-transfer and has not come back: cancelled on the PS5
+                s->ins_finished_ms = now;
+                snprintf(s->ins_err, sizeof s->ins_err,
+                         "stopped on the PS5 at %.1f of %.1f GB (cancelled there, or the install failed)",
+                         s->served / 1e9, s->size / 1e9);
+                save_streams_locked();
+                plat_log("install %.8s: stopped on the PS5 at %lld/%lld", s->token, (long long)s->served,
+                         (long long)s->size);
             } else if (!delivered && !s->active && quiet > quiet_stall) {
                 s->ins = 4;
                 s->ins_finished_ms = now;
@@ -1096,14 +1195,34 @@ int stream_install(const char *kind, const char *link, const char *name, sbuf *o
     return 0;
 }
 
-// Removes a finished or failed install (or a plain stream) from the list.
-int stream_remove(const char *id) {
+static void clear_slot_locked(stream_t *s) {
+    free(s->link);
+    if (s->direct) memset(s->direct, 0, strlen(s->direct)), free(s->direct);
+    pthread_cond_destroy(&s->cv);
+    memset(s, 0, sizeof *s);
+}
+
+// Removes a finished or failed install (or a plain stream) from the list. force: a running install is stopped
+// first (no more data for the PS5, so its install stops there) and removed once nothing uses it.
+int stream_remove(const char *id, int force) {
     pthread_mutex_lock(&g_lock);
     int rc = -1;
     for (int i = 0; i < MAX_STREAMS; i++) {
         stream_t *s = &g_streams[i];
         if (!s->token[0] || strncmp(s->token, id, strlen(id)) || strlen(id) < 8) continue;
-        if (s->active || s->ins == 1 || s->ins == 2) break;
+        if (s->active || s->ins == 1 || s->ins == 2) {
+            if (!force) break;
+            s->stopping = 1, s->ra_quit = 1;
+            s->ins = 5;
+            s->ins_finished_ms = plat_now_ms();
+            snprintf(s->ins_err, sizeof s->ins_err, "stopped from this page");
+            pthread_cond_broadcast(&s->cv);
+            save_streams_locked();
+            plat_log("install %.8s: stop requested", s->token);
+            pthread_mutex_unlock(&g_lock);
+            pthread_once(&g_monitor_once, start_monitor); // it removes the stream once it is idle
+            return 0;
+        }
         s->ra_quit = 1; // the read-ahead thread idles a while after the last request: stop it first
         for (int w = 0; s->ra_running && w < 50; w++) {
             struct timeval tv;
@@ -1116,10 +1235,7 @@ int stream_remove(const char *id) {
             s->ra_quit = 0;
             break;
         }
-        free(s->link);
-        if (s->direct) memset(s->direct, 0, strlen(s->direct)), free(s->direct);
-        pthread_cond_destroy(&s->cv);
-        memset(s, 0, sizeof *s);
+        clear_slot_locked(s);
         save_streams_locked();
         rc = 0;
         break;
@@ -1138,14 +1254,15 @@ void stream_list_json(sbuf *out) {
         if (!s->token[0]) continue;
         sb_printf(out, "%s{\"id\":\"%.8s\",\"kind\":\"%s\",\"size\":%lld,\"served\":%lld,\"requests\":%d,\"active\":%d,"
                        "\"idle_s\":%lld,\"install\":\"%s\",\"ins_done\":%lld,\"ins_total\":%lld,"
-                       "\"ins_age_s\":%lld,\"report_age_s\":%lld,\"ins_time_s\":%lld,\"speed\":%.0f,\"name\":",
+                       "\"ins_age_s\":%lld,\"report_age_s\":%lld,\"ins_time_s\":%lld,\"speed\":%.0f,"
+                       "\"net_speed\":%.0f,\"ahead\":%lld,\"speed_ok\":%s,\"name\":",
                   first ? "" : ",", s->token, s->kind, (long long)s->size, (long long)s->served, s->requests, s->active,
                   (long long)((now - s->last_ms) / 1000), ins_names[s->ins], (long long)s->ins_done,
                   (long long)s->ins_total, s->ins ? (long long)((now - s->ins_started_ms) / 1000) : -1,
                   s->ins ? (long long)((now - s->ins_report_ms) / 1000) : -1,
                   s->ins_finished_ms > s->ins_started_ms ? (long long)((s->ins_finished_ms - s->ins_started_ms) / 1000)
                                                          : -1,
-                  s->speed);
+                  s->speed, s->net_speed, (long long)s->ahead, s->sp_n >= 11 ? "true" : "false"); // >= 10 s measured
         sb_json_str(out, s->name);
         sb_puts(out, ",\"status\":");
         sb_json_str(out, s->ins_status);

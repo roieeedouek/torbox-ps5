@@ -6,11 +6,14 @@
 Answers "pkg_install <url>" like shsrv (a content_id line, then the prompt), then reads the package from <url> the
 way the PS5 installer does: header and tail first, then front to back in 18 MiB ranges, two at a time. Each read's
 bytes are checked (byte i must be i % 251). A URL whose name contains "partial" stops after ~20 MiB (a PS5 that gives
-up). RESULT_FILE gets one line per install: "<name> ok <bytes>" or "<name> bad <bytes>".
+up); one whose name contains "cancel" hangs up in the middle of a request and stops (a cancel on the PS5). RESULT_FILE gets one line per install: "<name> ok <bytes>" or "<name> bad <bytes>".
 """
+import http.client
 import socketserver
 import sys
 import threading
+import time
+import urllib.error
 import urllib.request
 
 CID = "UP0000-TEST00000_00-TORBOXTESTPKG000"
@@ -18,14 +21,32 @@ RESULT = sys.argv[2]
 LOCK = threading.Lock()
 
 
+def retrying(fn):
+    # Like the PS5's installer: keep trying while the server restarts (connection refused, a cut transfer).
+    for attempt in range(120):
+        try:
+            return fn()
+        except (urllib.error.URLError, http.client.HTTPException, ConnectionError, OSError) as e:
+            if isinstance(e, urllib.error.HTTPError) and e.code == 404:
+                raise
+            if attempt == 119:
+                raise
+            time.sleep(0.5)
+
+
 def size_of(url):
     req = urllib.request.Request(url, method="HEAD")
-    return int(urllib.request.urlopen(req, timeout=30).headers["Content-Length"])
+    return retrying(lambda: int(urllib.request.urlopen(req, timeout=30).headers["Content-Length"]))
 
 
 def get(url, a, b):
-    req = urllib.request.Request(url, headers={"Range": "bytes=%d-%d" % (a, b)})
-    return urllib.request.urlopen(req, timeout=120).read()
+    def once():
+        req = urllib.request.Request(url, headers={"Range": "bytes=%d-%d" % (a, b)})
+        data = urllib.request.urlopen(req, timeout=120).read()
+        if len(data) != b - a + 1:
+            raise ConnectionError("short read")
+        return data
+    return retrying(once)
 
 
 def ok(data, start):
@@ -40,6 +61,13 @@ def install(url):
         size = size_of(url)
         good &= ok(get(url, 0, 65535), 0) and ok(get(url, size - 65536, size - 1), size - 65536)
         chunk = 18 << 20
+        if "cancel" in name:  # hang up halfway through the first big request, like a cancel on the PS5
+            resp = urllib.request.urlopen(urllib.request.Request(url, headers={"Range": "bytes=65536-%d" % (65536 + chunk - 1)}), timeout=60)
+            part = resp.read(4 << 20)
+            resp.close()
+            with LOCK, open(RESULT, "a") as f:
+                f.write("%s cancelled %d\n" % (name, len(part) + 65536))
+            return
         starts = list(range(65536, size, chunk))
         if "partial" in name:
             starts = starts[:1]

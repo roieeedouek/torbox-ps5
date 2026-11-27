@@ -208,8 +208,11 @@ installs: no `.pkg` file is saved on the console, so only the installed game tak
 - Expired or dropped links are refreshed without the installer noticing. Streams are kept in
   `/data/torbox-ps5/streams.tsv` (hoster links, never direct links), so a server restart in the middle of an install
   is survived: the installer continues with the same address.
-- The install counts as done once the PS5 has pulled the whole package, and as failed if it stops pulling for 3
-  minutes. The PS5's own list has the final word.
+- The install counts as done once the PS5 has pulled the package (98% or more: it reads the package's metadata at
+  the end first and does not read it again) and then goes quiet. A cancel in the PS5's download list shows
+  as *stopped* within about 15 seconds (the installer hangs up and does not come back); if it stops pulling for 3
+  minutes for another reason, it shows as failed. *Stop* in the page stops sending the package (the PS5's install
+  then stops; delete the unfinished game there). The PS5's own list has the final word.
 - API: `POST /api/install` (kind `rd`/`ad`/`url` with `url=`, or a TorBox kind with `id=` and `file_id=`; `name=`),
   `GET /api/streams`, `POST /api/stream/remove`. `POST /api/stream` alone makes a stream without installing.
 

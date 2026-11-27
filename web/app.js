@@ -519,24 +519,34 @@ function renderInstall(s) {
   const pct = s.size > 0 ? Math.min(100, (s.served / s.size) * 100) : 0;
   const parts = [];
   if (s.size > 0) parts.push(size(s.served) + " of " + size(s.size) + " (" + pct.toFixed(1) + "%)");
-  if (running && s.speed > 0) parts.push(size(s.speed) + "/s");
-  if (running && s.speed > 0 && s.size > s.served) parts.push(duration((s.size - s.served) / s.speed) + " left");
+  // The installer pulls in bursts: speeds are 20-second averages (measured on the console), and so is time left.
+  if (running && s.install === "installing" && !s.speed_ok) parts.push("measuring speed...");
+  if (running && s.speed_ok && s.speed > 0) parts.push(size(s.speed) + "/s");
+  if (running && s.speed_ok && s.net_speed > 0 && Math.abs(s.net_speed - s.speed) > s.speed * 0.25) parts.push("network " + size(s.net_speed) + "/s");
+  if (running && s.speed_ok && s.speed > 0 && s.size > s.served) parts.push(duration((s.size - s.served) / s.speed) + " left");
+  const installerPace = running && s.speed_ok && s.ahead > 256 * 1048576 && s.net_speed > s.speed * 1.25;
   if (s.install === "installed" && s.ins_time_s > 0) parts.push("in " + duration(s.ins_time_s));
-  const label = { starting: "starting the installer", installing: "installing", installed: "installed", failed: "failed" }[s.install];
+  const label = { starting: "starting the installer", installing: "installing", installed: "installed", failed: "failed",
+    stopped: "stopped" }[s.install];
   const quiet = running && s.report_age_s > 60;
   return el("div", { class: "item job install " + s.install },
     el("div", { class: "item-name" }, s.name),
     el("div", { class: "meta" },
-      el("span", { class: "state " + (s.install === "installed" ? "ready" : s.install === "failed" ? "bad" : "busy") }, label),
+      el("span", { class: "state " + (s.install === "installed" ? "ready" : ["failed", "stopped"].includes(s.install) ? "bad" : "busy") }, label),
       el("span", {}, "Stream Install"), parts.length ? el("span", {}, parts.join(" · ")) : null),
     el("div", { class: "bar" }, el("div", { style: "width:" + (s.install === "installed" ? 100 : pct) + "%" })),
     s.content_id ? el("div", { class: "meta" }, el("code", {}, s.content_id)) : null,
     s.error ? el("div", { class: "error small" }, s.error) : null,
+    installerPace ? el("div", { class: "muted small" }, size(s.ahead) + " is already downloaded and waiting: the PS5's " +
+      "installer sets the pace right now (it unpacks and writes in bursts).") : null,
     quiet ? el("div", { class: "muted small" }, "The PS5 has not pulled any data for " + duration(s.report_age_s) +
       ": check Downloads on the PS5.") : null,
-    running ? el("div", { class: "muted small" }, "To cancel, use the download list on the PS5.") : null,
-    el("div", { class: "actions" }, !running ? el("button", { class: "small", type: "button",
-      onclick: () => api("stream/remove", { id: s.id }).then(pollJobs).catch((e) => toast(e.message)) }, "Remove from list") : null));
+    el("div", { class: "actions" },
+      running ? el("button", { class: "small danger", type: "button", onclick: () => {
+        if (confirm("Stop installing " + s.name + "?\n\nThe PS5 gets no more data, so its install stops; delete the " +
+            "unfinished game on the PS5 afterwards.")) api("stream/remove", { id: s.id, force: 1 }).then(pollJobs).catch((e) => toast(e.message));
+      } }, "Stop") : el("button", { class: "small", type: "button",
+        onclick: () => api("stream/remove", { id: s.id }).then(pollJobs).catch((e) => toast(e.message)) }, "Remove from list")));
 }
 
 function renderJobs() {

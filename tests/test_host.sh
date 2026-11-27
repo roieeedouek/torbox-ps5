@@ -24,7 +24,7 @@ start_app() {
     TORBOX_API_BASE=http://127.0.0.1:$mport/v1/api RD_API_BASE=http://127.0.0.1:$mport/rest/1.0 AD_API_BASE=http://127.0.0.1:$mport AD_DELAYED_POLL_MS=200 \
         TORBOX_UPDATE_URL=http://127.0.0.1:$mport/repos/x/torbox-ps5/releases/latest TORBOX_APP_DIR=$work/app TORBOX_DOWNLOADS=$work/dl \
         TORBOX_ROOTS=$work TORBOX_PORT=$port TORBOX_LOW_SPEED_TIME=2 TORBOX_STALL_MS=4000 TORBOX_RETRY_MAX_MS=500 TORBOX_LEGACY_PORT=0 \
-        TORBOX_SHSRV_PORT=$sport TORBOX_INSTALL_QUIET_MS=1500 TORBOX_INSTALL_STALL_MS=4000 ${1+"$@"} "$bin" >> "$work/app.log" 2>&1 &
+        TORBOX_SHSRV_PORT=$sport TORBOX_INSTALL_QUIET_MS=1500 TORBOX_INSTALL_STALL_MS=6000 TORBOX_INSTALL_CANCEL_MS=2000 TORBOX_INSTALL_SAVE_MS=300 ${1+"$@"} "$bin" >> "$work/app.log" 2>&1 &
     app_pid=$!
     pids+=($app_pid)
     for _ in $(seq 50); do curl -s "$base/api/status" > /dev/null && return; sleep 0.1; done
@@ -337,6 +337,37 @@ EOF
 }
 check "install: progress grows smoothly and speed is shown ($samples)" smooth "$samples"
 check "install: slow one finishes" wait_install "$stok" installed 90
+# A server restart in the middle: progress carries on from where it was, and the install still finishes.
+r=$(post install -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((120 * 1048576))?rate=1500000" -d name=restart.pkg)
+rtok=$(jq_ 'd.get("token", "")' <<<"$r")
+served_of() { get streams | jq_ "[x['served'] for x in d['streams'] if x['id']=='${1:0:8}'][0]"; }
+for _ in $(seq 100); do (( $(served_of "$rtok") > 30 * 1048576 )) && break; sleep 0.2; done
+sleep 1
+before=$(served_of "$rtok")
+kill "$app_pid"; wait "$app_pid" 2>/dev/null || true
+start_app
+after=$(served_of "$rtok")
+check "install: progress kept across a restart ($before -> $after)" test "$after" -ge $((before - 8 * 1048576))
+check "install: finishes after the restart" wait_install "$rtok" installed 120
+check "install: bytes exact across the restart" bash -c "grep -q '^restart.pkg ok $((120 * 1048576))$' $work/installs.txt"
+# Cancelled on the PS5: the installer hangs up mid-transfer and never comes back.
+r=$(post install -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((80 * 1048576))" -d name=cancel.pkg)
+ctok=$(jq_ 'd.get("token", "")' <<<"$r")
+check "install: a cancel on the PS5 shows as stopped" wait_install "$ctok" stopped 30
+check "install: says it stopped on the PS5" bash -c "curl -s $base/api/streams | grep -q 'stopped on the PS5'"
+r=$(post stream/remove -d id="${ctok:0:8}")
+check "install: a stopped one can be removed" bash -c "! curl -s $base/api/streams | grep -q '${ctok:0:8}'"
+# Stop from the page: a running install is refused without force, stopped and removed with it.
+r=$(post install -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((200 * 1048576))?rate=500000" -d name=stopme.pkg)
+xtok=$(jq_ 'd.get("token", "")' <<<"$r")
+wait_install "$xtok" installing 20 || true
+sleep 2
+r=$(post stream/remove -d id="${xtok:0:8}")
+check "install: a running one is not removed without Stop" bash -c "grep -q 'use Stop' <<<'$r'"
+r=$(post stream/remove -d id="${xtok:0:8}" -d force=1)
+gone_soon() { for _ in $(seq 75); do curl -s $base/api/streams | grep -q "$1" || return 0; sleep 0.2; done; return 1; }
+check "install: Stop removes it" gone_soon "${xtok:0:8}"
+check "install: after Stop its URL is refused" bash -c "[[ \$(curl -s -o /dev/null -w '%{http_code}' -r 0-99 $base/stream/$xtok/stopme.pkg) == 404 ]]"
 kill $shsrv_pid; wait $shsrv_pid 2>/dev/null || true
 post install -d kind=url --data-urlencode "url=http://127.0.0.1:$mport/files/$((8 * 1048576))" -d name=noshell.pkg > "$work/noshell.json"
 check "install: no shsrv gives a readable error" grep -q "shsrv, port $sport) is not running" "$work/noshell.json"
